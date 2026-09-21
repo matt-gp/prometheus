@@ -71,8 +71,9 @@ scrape_configs:
       - names:
           - first.dns.address.domain.com
 
-    ec2_sd_configs:
-      - region: us-east-1
+    aws_sd_configs:
+      - role: ec2
+        region: us-east-1
         access_key: access
         secret_key: <secret>
         profile: profile

@@ -24,9 +24,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/common/config"
 	"github.com/prometheus/common/model"
 	"github.com/stretchr/testify/require"
 	"go.yaml.in/yaml/v3"
+
+	"github.com/prometheus/prometheus/discovery"
+	"github.com/prometheus/prometheus/discovery/targetgroup"
 )
 
 func TestRoleUnmarshalYAML(t *testing.T) {
@@ -36,6 +41,8 @@ func TestRoleUnmarshalYAML(t *testing.T) {
 		input    string
 		expected Role
 		wantErr  bool
+		// unmarshalErr is returned by the unmarshal func instead of input.
+		unmarshalErr error
 	}{
 		{
 			name:     "EC2Role",
@@ -56,10 +63,35 @@ func TestRoleUnmarshalYAML(t *testing.T) {
 			wantErr:  false,
 		},
 		{
+			name:     "ElasticacheRole",
+			input:    "elasticache",
+			expected: RoleElasticache,
+		},
+		{
+			name:     "MQRole",
+			input:    "mq",
+			expected: RoleMQ,
+		},
+		{
+			name:     "MSKRole",
+			input:    "msk",
+			expected: RoleMSK,
+		},
+		{
+			name:     "RDSRole",
+			input:    "rds",
+			expected: RoleRDS,
+		},
+		{
 			name:     "InvalidRole",
 			input:    "invalid",
 			expected: "invalid",
 			wantErr:  true,
+		},
+		{
+			name:         "UnmarshalError",
+			wantErr:      true,
+			unmarshalErr: errors.New("boom"),
 		},
 	}
 
@@ -106,6 +138,26 @@ func TestRoleString(t *testing.T) {
 			role:     RoleECS,
 			expected: "ecs",
 		},
+		{
+			name:     "Elasticache",
+			role:     RoleElasticache,
+			expected: "elasticache",
+		},
+		{
+			name:     "MQ",
+			role:     RoleMQ,
+			expected: "mq",
+		},
+		{
+			name:     "MSK",
+			role:     RoleMSK,
+			expected: "msk",
+		},
+		{
+			name:     "RDS",
+			role:     RoleRDS,
+			expected: "rds",
+		},
 	}
 
 	for _, tt := range tests {
@@ -125,6 +177,8 @@ func TestDefaultSDConfig(t *testing.T) {
 	t.Parallel()
 	require.Equal(t, Role(""), DefaultSDConfig.Role)
 	require.Equal(t, model.Duration(60*time.Second), DefaultSDConfig.RefreshInterval)
+	require.Equal(t, 80, DefaultSDConfig.Port)
+	require.Equal(t, 10, DefaultSDConfig.RequestConcurrency)
 }
 
 func TestSDConfigUnmarshalYAML(t *testing.T) {
@@ -144,12 +198,11 @@ filters:
     values: [running]`,
 			validateFunc: func(t *testing.T, cfg *SDConfig) {
 				require.Equal(t, RoleEC2, cfg.Role)
-				require.NotNil(t, cfg.EC2SDConfig)
-				require.Equal(t, "us-west-2", cfg.EC2SDConfig.Region)
-				require.Equal(t, 9100, cfg.EC2SDConfig.Port)
-				require.Len(t, cfg.EC2SDConfig.Filters, 1)
-				require.Equal(t, "instance-state-name", cfg.EC2SDConfig.Filters[0].Name)
-				require.Equal(t, []string{"running"}, cfg.EC2SDConfig.Filters[0].Values)
+				require.Equal(t, "us-west-2", cfg.Region)
+				require.Equal(t, 9100, cfg.Port)
+				require.Len(t, cfg.Filters, 1)
+				require.Equal(t, "instance-state-name", cfg.Filters[0].Name)
+				require.Equal(t, []string{"running"}, cfg.Filters[0].Values)
 			},
 		},
 		{
@@ -160,10 +213,9 @@ port: 9200
 clusters: ["some-cluster"]`,
 			validateFunc: func(t *testing.T, cfg *SDConfig) {
 				require.Equal(t, RoleECS, cfg.Role)
-				require.NotNil(t, cfg.ECSSDConfig)
-				require.Equal(t, "us-east-1", cfg.ECSSDConfig.Region)
-				require.Equal(t, 9200, cfg.ECSSDConfig.Port)
-				require.Equal(t, []string{"some-cluster"}, cfg.ECSSDConfig.Clusters)
+				require.Equal(t, "us-east-1", cfg.Region)
+				require.Equal(t, 9200, cfg.Port)
+				require.Equal(t, []string{"some-cluster"}, cfg.Clusters)
 			},
 		},
 		{
@@ -173,9 +225,8 @@ region: eu-central-1
 port: 9300`,
 			validateFunc: func(t *testing.T, cfg *SDConfig) {
 				require.Equal(t, RoleLightsail, cfg.Role)
-				require.NotNil(t, cfg.LightsailSDConfig)
-				require.Equal(t, "eu-central-1", cfg.LightsailSDConfig.Region)
-				require.Equal(t, 9300, cfg.LightsailSDConfig.Port)
+				require.Equal(t, "eu-central-1", cfg.Region)
+				require.Equal(t, 9300, cfg.Port)
 			},
 		},
 		{
@@ -188,12 +239,56 @@ filters:
     values: [aurora-postgresql]`,
 			validateFunc: func(t *testing.T, cfg *SDConfig) {
 				require.Equal(t, RoleRDS, cfg.Role)
-				require.NotNil(t, cfg.RDSSDConfig)
-				require.Equal(t, "us-east-1", cfg.RDSSDConfig.Region)
-				require.Equal(t, 9400, cfg.RDSSDConfig.Port)
-				require.Len(t, cfg.RDSSDConfig.Filters, 1)
-				require.Equal(t, "engine", cfg.RDSSDConfig.Filters[0].Name)
-				require.Equal(t, []string{"aurora-postgresql"}, cfg.RDSSDConfig.Filters[0].Values)
+				require.Equal(t, "us-east-1", cfg.Region)
+				require.Equal(t, 9400, cfg.Port)
+				require.Len(t, cfg.Filters, 1)
+				require.Equal(t, "engine", cfg.Filters[0].Name)
+				require.Equal(t, []string{"aurora-postgresql"}, cfg.Filters[0].Values)
+			},
+		},
+		{
+			name: "MQWithFlatFields",
+			yaml: `role: mq
+region: us-west-1
+port: 9700`,
+			validateFunc: func(t *testing.T, cfg *SDConfig) {
+				require.Equal(t, RoleMQ, cfg.Role)
+				require.Equal(t, "us-west-1", cfg.Region)
+				require.Equal(t, 9700, cfg.Port)
+			},
+		},
+		{
+			name: "MSKWithFlatFields",
+			yaml: `role: msk
+region: ap-south-1
+port: 9500
+clusters: ["some-cluster"]`,
+			validateFunc: func(t *testing.T, cfg *SDConfig) {
+				require.Equal(t, RoleMSK, cfg.Role)
+				require.Equal(t, "ap-south-1", cfg.Region)
+				require.Equal(t, 9500, cfg.Port)
+				require.Equal(t, []string{"some-cluster"}, cfg.Clusters)
+			},
+		},
+		{
+			name: "ElasticacheWithFlatFields",
+			yaml: `role: elasticache
+region: eu-west-1
+port: 9600`,
+			validateFunc: func(t *testing.T, cfg *SDConfig) {
+				require.Equal(t, RoleElasticache, cfg.Role)
+				require.Equal(t, "eu-west-1", cfg.Region)
+				require.Equal(t, 9600, cfg.Port)
+			},
+		},
+		{
+			name: "DefaultsApplyWhenFieldsOmitted",
+			yaml: `role: ec2
+region: us-west-2`,
+			validateFunc: func(t *testing.T, cfg *SDConfig) {
+				require.Equal(t, DefaultSDConfig.Port, cfg.Port)
+				require.Equal(t, DefaultSDConfig.RequestConcurrency, cfg.RequestConcurrency)
+				require.Equal(t, DefaultSDConfig.RefreshInterval, cfg.RefreshInterval)
 			},
 		},
 	}
@@ -208,9 +303,9 @@ filters:
 }
 
 // TestMultipleSDConfigsDoNotShareState verifies that multiple AWS SD configs
-// don't share the same underlying configuration object. This was a bug where
-// all configs pointed to the same global default, causing port and other
-// settings from one job to overwrite settings in another job.
+// parsed from the same YAML document don't bleed state into each other. This
+// was a bug where all configs pointed to the same global default, causing
+// port and other settings from one job to overwrite settings in another job.
 func TestMultipleSDConfigsDoNotShareState(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
@@ -236,22 +331,16 @@ func TestMultipleSDConfigsDoNotShareState(t *testing.T) {
 			validateFunc: func(t *testing.T, cfg1, cfg2 *SDConfig) {
 				require.Equal(t, RoleEC2, cfg1.Role)
 				require.Equal(t, RoleEC2, cfg2.Role)
-				require.NotNil(t, cfg1.EC2SDConfig)
-				require.NotNil(t, cfg2.EC2SDConfig)
 
-				// Verify ports are different and not shared
-				require.Equal(t, 9100, cfg1.EC2SDConfig.Port)
-				require.Equal(t, 9101, cfg2.EC2SDConfig.Port)
+				// Verify ports are different and not shared.
+				require.Equal(t, 9100, cfg1.Port)
+				require.Equal(t, 9101, cfg2.Port)
 
-				// Verify filters are different and not shared
-				require.Len(t, cfg1.EC2SDConfig.Filters, 1)
-				require.Len(t, cfg2.EC2SDConfig.Filters, 1)
-				require.Equal(t, []string{"host-1"}, cfg1.EC2SDConfig.Filters[0].Values)
-				require.Equal(t, []string{"host-2"}, cfg2.EC2SDConfig.Filters[0].Values)
-
-				// Most importantly: verify they're not the same pointer
-				require.NotSame(t, cfg1.EC2SDConfig, cfg2.EC2SDConfig,
-					"EC2SDConfig objects should not share the same memory address")
+				// Verify filters are different and not shared.
+				require.Len(t, cfg1.Filters, 1)
+				require.Len(t, cfg2.Filters, 1)
+				require.Equal(t, []string{"host-1"}, cfg1.Filters[0].Values)
+				require.Equal(t, []string{"host-2"}, cfg2.Filters[0].Values)
 			},
 		},
 		{
@@ -268,16 +357,11 @@ func TestMultipleSDConfigsDoNotShareState(t *testing.T) {
 			validateFunc: func(t *testing.T, cfg1, cfg2 *SDConfig) {
 				require.Equal(t, RoleECS, cfg1.Role)
 				require.Equal(t, RoleECS, cfg2.Role)
-				require.NotNil(t, cfg1.ECSSDConfig)
-				require.NotNil(t, cfg2.ECSSDConfig)
 
-				require.Equal(t, 8080, cfg1.ECSSDConfig.Port)
-				require.Equal(t, 8081, cfg2.ECSSDConfig.Port)
-				require.Equal(t, []string{"cluster-a"}, cfg1.ECSSDConfig.Clusters)
-				require.Equal(t, []string{"cluster-b"}, cfg2.ECSSDConfig.Clusters)
-
-				require.NotSame(t, cfg1.ECSSDConfig, cfg2.ECSSDConfig,
-					"ECSSDConfig objects should not share the same memory address")
+				require.Equal(t, 8080, cfg1.Port)
+				require.Equal(t, 8081, cfg2.Port)
+				require.Equal(t, []string{"cluster-a"}, cfg1.Clusters)
+				require.Equal(t, []string{"cluster-b"}, cfg2.Clusters)
 			},
 		},
 		{
@@ -292,14 +376,9 @@ func TestMultipleSDConfigsDoNotShareState(t *testing.T) {
 			validateFunc: func(t *testing.T, cfg1, cfg2 *SDConfig) {
 				require.Equal(t, RoleLightsail, cfg1.Role)
 				require.Equal(t, RoleLightsail, cfg2.Role)
-				require.NotNil(t, cfg1.LightsailSDConfig)
-				require.NotNil(t, cfg2.LightsailSDConfig)
 
-				require.Equal(t, 7070, cfg1.LightsailSDConfig.Port)
-				require.Equal(t, 7071, cfg2.LightsailSDConfig.Port)
-
-				require.NotSame(t, cfg1.LightsailSDConfig, cfg2.LightsailSDConfig,
-					"LightsailSDConfig objects should not share the same memory address")
+				require.Equal(t, 7070, cfg1.Port)
+				require.Equal(t, 7071, cfg2.Port)
 			},
 		},
 		{
@@ -316,16 +395,11 @@ func TestMultipleSDConfigsDoNotShareState(t *testing.T) {
 			validateFunc: func(t *testing.T, cfg1, cfg2 *SDConfig) {
 				require.Equal(t, RoleMSK, cfg1.Role)
 				require.Equal(t, RoleMSK, cfg2.Role)
-				require.NotNil(t, cfg1.MSKSDConfig)
-				require.NotNil(t, cfg2.MSKSDConfig)
 
-				require.Equal(t, 6060, cfg1.MSKSDConfig.Port)
-				require.Equal(t, []string{"cluster-1"}, cfg1.MSKSDConfig.Clusters)
-				require.Equal(t, 6061, cfg2.MSKSDConfig.Port)
-				require.Equal(t, []string{"cluster-2"}, cfg2.MSKSDConfig.Clusters)
-
-				require.NotSame(t, cfg1.MSKSDConfig, cfg2.MSKSDConfig,
-					"MSKSDConfig objects should not share the same memory address")
+				require.Equal(t, 6060, cfg1.Port)
+				require.Equal(t, []string{"cluster-1"}, cfg1.Clusters)
+				require.Equal(t, 6061, cfg2.Port)
+				require.Equal(t, []string{"cluster-2"}, cfg2.Clusters)
 			},
 		},
 	}
@@ -527,6 +601,7 @@ func TestAWSSDConfigUnmarshalYAML_NoRegionResolution(t *testing.T) {
 		"ec2":         `region: ""`,
 		"ecs":         `region: ""`,
 		"rds":         `region: ""`,
+		"mq":          `region: ""`,
 		"msk":         `region: ""`,
 		"elasticache": `region: ""`,
 		"lightsail":   `region: ""`,
@@ -550,51 +625,6 @@ func TestAWSSDConfigUnmarshalYAML_NoRegionResolution(t *testing.T) {
 func TestRequestConcurrencyUnmarshalYAML(t *testing.T) {
 	t.Parallel()
 
-	// Every AWS SD config that exposes request_concurrency, along with the
-	// default it falls back to when the field is omitted.
-	configs := []struct {
-		name               string
-		defaultConcurrency int
-		parse              func(string) (int, error)
-	}{
-		{
-			name:               "ecs_sd",
-			defaultConcurrency: DefaultECSSDConfig.RequestConcurrency,
-			parse: func(s string) (int, error) {
-				var cfg ECSSDConfig
-				err := yaml.Unmarshal([]byte(s), &cfg)
-				return cfg.RequestConcurrency, err
-			},
-		},
-		{
-			name:               "elasticache_sd",
-			defaultConcurrency: DefaultElasticacheSDConfig.RequestConcurrency,
-			parse: func(s string) (int, error) {
-				var cfg ElasticacheSDConfig
-				err := yaml.Unmarshal([]byte(s), &cfg)
-				return cfg.RequestConcurrency, err
-			},
-		},
-		{
-			name:               "msk_sd",
-			defaultConcurrency: DefaultMSKSDConfig.RequestConcurrency,
-			parse: func(s string) (int, error) {
-				var cfg MSKSDConfig
-				err := yaml.Unmarshal([]byte(s), &cfg)
-				return cfg.RequestConcurrency, err
-			},
-		},
-		{
-			name:               "rds_sd",
-			defaultConcurrency: DefaultRDSSDConfig.RequestConcurrency,
-			parse: func(s string) (int, error) {
-				var cfg RDSSDConfig
-				err := yaml.Unmarshal([]byte(s), &cfg)
-				return cfg.RequestConcurrency, err
-			},
-		},
-	}
-
 	cases := []struct {
 		name        string
 		yaml        string
@@ -605,12 +635,12 @@ func TestRequestConcurrencyUnmarshalYAML(t *testing.T) {
 		{
 			name:        "Zero",
 			yaml:        "request_concurrency: 0",
-			expectedErr: "request_concurrency must be positive, got 0",
+			expectedErr: "aws_sd: request_concurrency must be positive, got 0",
 		},
 		{
 			name:        "Negative",
 			yaml:        "request_concurrency: -1",
-			expectedErr: "request_concurrency must be positive, got -1",
+			expectedErr: "aws_sd: request_concurrency must be positive, got -1",
 		},
 		{
 			name:     "Positive",
@@ -624,25 +654,25 @@ func TestRequestConcurrencyUnmarshalYAML(t *testing.T) {
 		},
 	}
 
-	for _, cfg := range configs {
-		for _, tt := range cases {
-			t.Run(cfg.name+"/"+tt.name, func(t *testing.T) {
-				t.Parallel()
-				got, err := cfg.parse("region: us-west-2\n" + tt.yaml + "\n")
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 
-				if tt.expectedErr != "" {
-					require.EqualError(t, err, cfg.name+": "+tt.expectedErr)
-					return
-				}
+			var cfg SDConfig
+			err := yaml.Unmarshal([]byte("role: ec2\nregion: us-west-2\n"+tt.yaml+"\n"), &cfg)
 
-				require.NoError(t, err)
-				expected := tt.expected
-				if tt.wantDefault {
-					expected = cfg.defaultConcurrency
-				}
-				require.Equal(t, expected, got)
-			})
-		}
+			if tt.expectedErr != "" {
+				require.EqualError(t, err, tt.expectedErr)
+				return
+			}
+
+			require.NoError(t, err)
+			expected := tt.expected
+			if tt.wantDefault {
+				expected = DefaultSDConfig.RequestConcurrency
+			}
+			require.Equal(t, expected, cfg.RequestConcurrency)
+		})
 	}
 }
 
@@ -688,6 +718,14 @@ region: ap-south-1
 			role: RoleLightsail,
 		},
 		{
+			name: "MQ",
+			yaml: `
+role: mq
+region: us-west-2
+`,
+			role: RoleMQ,
+		},
+		{
 			name: "MSK",
 			yaml: `
 role: msk
@@ -718,17 +756,399 @@ region: us-west-1
 			})
 		})
 	}
+}
 
-	t.Run("SetDirectoryWithNilConfigs", func(t *testing.T) {
-		// Test that SetDirectory doesn't panic when called on an SDConfig
-		// where the role-specific config might be nil (this was the original bug)
-		cfg := SDConfig{
-			Role: RoleEC2,
-			// EC2SDConfig is nil - this would have caused a panic before the fix
-		}
-		// This should not panic
-		require.NotPanics(t, func() {
-			cfg.SetDirectory(tmpDir)
+func TestSDConfigUnmarshalYAMLErrors(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name        string
+		yaml        string
+		expectedErr string
+	}{
+		{
+			name:        "UnknownRole",
+			yaml:        "role: nope",
+			expectedErr: `unknown AWS SD role "nope"`,
+		},
+		{
+			name:        "EmptyFilterValues",
+			yaml:        "role: ec2\nfilters:\n  - name: instance-state-name\n    values: []",
+			expectedErr: "Filter values cannot be empty",
+		},
+		{
+			name:        "MissingFilterValues",
+			yaml:        "role: rds\nfilters:\n  - name: engine",
+			expectedErr: "Filter values cannot be empty",
+		},
+		{
+			name:        "InvalidHTTPClientConfig",
+			yaml:        "role: ec2\nbasic_auth:\n  username: u\n  password: p\nauthorization:\n  credentials: c",
+			expectedErr: "at most one of basic_auth, oauth2 & authorization must be configured",
+		},
+		{
+			name:        "WrongFieldType",
+			yaml:        "role: ec2\nport: not-a-number",
+			expectedErr: "cannot unmarshal",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			var cfg SDConfig
+			err := yaml.Unmarshal([]byte(tt.yaml), &cfg)
+			require.ErrorContains(t, err, tt.expectedErr)
 		})
-	})
+	}
+}
+
+func TestSDConfigRefreshMechanism(t *testing.T) {
+	t.Parallel()
+	for _, role := range []Role{RoleEC2, RoleECS, RoleElasticache, RoleLightsail, RoleMQ, RoleMSK, RoleRDS} {
+		t.Run(role.String(), func(t *testing.T) {
+			t.Parallel()
+			require.Equal(t, role.String(), (&SDConfig{Role: role}).RefreshMechanism())
+		})
+	}
+}
+
+func TestSDConfigNewDiscovererMetrics(t *testing.T) {
+	t.Parallel()
+	reg := prometheus.NewRegistry()
+	rmi := discovery.NewRefreshMetrics(reg)
+
+	m := (&SDConfig{}).NewDiscovererMetrics(reg, rmi)
+	require.IsType(t, &awsMetrics{}, m)
+	require.NoError(t, m.Register())
+	m.Unregister()
+}
+
+// awsAPIStub returns a fake AWS endpoint. Every request gets the given status
+// and body; 4xx statuses are not retried by the AWS SDK so error paths stay fast.
+func awsAPIStub(t *testing.T, status int, contentType, body string) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", contentType)
+		w.WriteHeader(status)
+		_, _ = w.Write([]byte(body))
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// setAWSTestEnv isolates the test from any ambient AWS configuration.
+func setAWSTestEnv(t *testing.T) {
+	t.Helper()
+	t.Setenv("AWS_ACCESS_KEY_ID", "dummy")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "dummy")
+	t.Setenv("AWS_REGION", "")
+	t.Setenv("AWS_DEFAULT_REGION", "")
+	t.Setenv("AWS_CONFIG_FILE", "")
+	t.Setenv("AWS_SHARED_CREDENTIALS_FILE", "")
+	t.Setenv("AWS_PROFILE", "")
+	t.Setenv("AWS_EC2_METADATA_SERVICE_ENDPOINT", "http://127.0.0.1:1")
+	t.Setenv("AWS_EC2_METADATA_DISABLED", "")
+}
+
+func newTestMetrics() *awsMetrics {
+	return &awsMetrics{refreshMetrics: discovery.NewRefreshMetrics(prometheus.NewRegistry())}
+}
+
+func TestNewDiscovery(t *testing.T) {
+	setAWSTestEnv(t)
+
+	// Minimal successful responses for the credential check each role makes.
+	const (
+		jsonType = "application/json"
+		xmlType  = "text/xml"
+	)
+	roles := []struct {
+		role        Role
+		contentType string
+		body        string
+	}{
+		{RoleEC2, xmlType, `<DescribeAvailabilityZonesResponse xmlns="http://ec2.amazonaws.com/doc/2016-11-15/"><availabilityZoneInfo/></DescribeAvailabilityZonesResponse>`},
+		{RoleECS, jsonType, `{}`},
+		{RoleElasticache, xmlType, `<DescribeCacheClustersResponse xmlns="http://elasticache.amazonaws.com/doc/2015-02-02/"><DescribeCacheClustersResult/></DescribeCacheClustersResponse>`},
+		{RoleLightsail, jsonType, `{}`},
+		{RoleMQ, jsonType, `{}`},
+		{RoleMSK, jsonType, `{}`},
+		{RoleRDS, xmlType, `<DescribeDBClustersResponse xmlns="http://rds.amazonaws.com/doc/2014-10-31/"><DescribeDBClustersResult/></DescribeDBClustersResponse>`},
+	}
+
+	for _, r := range roles {
+		t.Run(r.role.String()+"/success", func(t *testing.T) {
+			srv := awsAPIStub(t, http.StatusOK, r.contentType, r.body)
+			cfg := DefaultSDConfig
+			cfg.Role = r.role
+			cfg.Region = "us-east-1"
+			cfg.Endpoint = srv.URL
+
+			d, err := NewDiscovery(&cfg, discovery.DiscovererOptions{Metrics: newTestMetrics()})
+			require.NoError(t, err)
+			require.NotNil(t, d.awsDiscovery)
+			require.Equal(t, "us-east-1", d.region)
+		})
+
+		t.Run(r.role.String()+"/credential_check_fails", func(t *testing.T) {
+			srv := awsAPIStub(t, http.StatusBadRequest, jsonType, `{"__type":"AccessDeniedException","message":"denied"}`)
+			cfg := DefaultSDConfig
+			cfg.Role = r.role
+			cfg.Region = "us-east-1"
+			cfg.Endpoint = srv.URL
+
+			d, err := NewDiscovery(&cfg, discovery.DiscovererOptions{Metrics: newTestMetrics()})
+			require.Error(t, err)
+			require.Nil(t, d)
+		})
+	}
+
+	tests := []struct {
+		name        string
+		opts        discovery.DiscovererOptions
+		mutate      func(*SDConfig)
+		expectedErr string
+	}{
+		{
+			name:        "InvalidMetricsType",
+			opts:        discovery.DiscovererOptions{Metrics: nil},
+			expectedErr: "invalid discovery metrics type for AWS SD",
+		},
+		{
+			name:        "UnknownRole",
+			opts:        discovery.DiscovererOptions{Metrics: newTestMetrics()},
+			mutate:      func(c *SDConfig) { c.Role = "bogus" },
+			expectedErr: "unknown role",
+		},
+		{
+			name: "InvalidHTTPClientConfig",
+			opts: discovery.DiscovererOptions{Metrics: newTestMetrics()},
+			mutate: func(c *SDConfig) {
+				c.HTTPClientConfig.TLSConfig = config.TLSConfig{CAFile: "/does/not/exist"}
+			},
+			expectedErr: "unable to read CA cert",
+		},
+		{
+			name:        "RegionUnresolvable",
+			opts:        discovery.DiscovererOptions{Metrics: newTestMetrics()},
+			mutate:      func(c *SDConfig) { c.Region = "" },
+			expectedErr: "could not determine AWS region",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := DefaultSDConfig
+			cfg.Role = RoleEC2
+			cfg.Region = "us-east-1"
+			if tt.mutate != nil {
+				tt.mutate(&cfg)
+			}
+
+			d, err := NewDiscovery(&cfg, tt.opts)
+			require.ErrorContains(t, err, tt.expectedErr)
+			require.Nil(t, d)
+		})
+	}
+}
+
+func TestSDConfigNewDiscoverer(t *testing.T) {
+	setAWSTestEnv(t)
+	srv := awsAPIStub(t, http.StatusOK, "application/json", `{}`)
+
+	cfg := DefaultSDConfig
+	cfg.Role = RoleECS
+	cfg.Region = "us-east-1"
+	cfg.Endpoint = srv.URL
+
+	d, err := cfg.NewDiscoverer(discovery.DiscovererOptions{Metrics: newTestMetrics()})
+	require.NoError(t, err)
+	require.NotNil(t, d)
+
+	_, err = cfg.NewDiscoverer(discovery.DiscovererOptions{})
+	require.Error(t, err)
+}
+
+func TestNewAWSCfg(t *testing.T) {
+	tests := []struct {
+		name  string
+		setup func(t *testing.T) *SDConfig
+		check func(t *testing.T, d *Discovery, cfg *SDConfig)
+	}{
+		{
+			name: "StaticCredentials",
+			setup: func(*testing.T) *SDConfig {
+				return &SDConfig{Region: "eu-west-1", AccessKey: "AKID", SecretKey: "SECRET"}
+			},
+			check: func(t *testing.T, d *Discovery, _ *SDConfig) {
+				require.Equal(t, "eu-west-1", d.region)
+			},
+		},
+		{
+			name: "SharedConfigProfile",
+			setup: func(t *testing.T) *SDConfig {
+				f := filepath.Join(t.TempDir(), "config")
+				require.NoError(t, os.WriteFile(f, []byte("[profile prom]\naws_access_key_id = PROFILEKEY\naws_secret_access_key = PROFILESECRET\n"), 0o600))
+				t.Setenv("AWS_CONFIG_FILE", f)
+				t.Setenv("AWS_ACCESS_KEY_ID", "")
+				t.Setenv("AWS_SECRET_ACCESS_KEY", "")
+				return &SDConfig{Region: "us-east-1", Profile: "prom"}
+			},
+			check: func(t *testing.T, _ *Discovery, _ *SDConfig) {},
+		},
+		{
+			name: "AssumeRoleWithExternalID",
+			setup: func(*testing.T) *SDConfig {
+				return &SDConfig{Region: "us-east-1", RoleARN: "arn:aws:iam::123456789012:role/prom", ExternalID: "ext"}
+			},
+			check: func(t *testing.T, _ *Discovery, _ *SDConfig) {},
+		},
+		{
+			name: "UnknownProfile",
+			setup: func(*testing.T) *SDConfig {
+				return &SDConfig{Region: "us-east-1", Profile: "missing"}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			setAWSTestEnv(t)
+			sdCfg := tt.setup(t)
+			sdCfg.HTTPClientConfig = config.DefaultHTTPClientConfig
+			d := &Discovery{cfg: sdCfg}
+
+			awsCfg, err := d.newAWSCfg(context.Background())
+			if tt.check == nil {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, sdCfg.Region, awsCfg.Region)
+			require.NotNil(t, awsCfg.HTTPClient)
+			require.NotNil(t, awsCfg.Credentials)
+			tt.check(t, d, sdCfg)
+		})
+	}
+}
+
+// TestNewAWSCfgCredentialSources verifies which credentials end up in the config.
+func TestNewAWSCfgCredentialSources(t *testing.T) {
+	tests := []struct {
+		name      string
+		cfg       SDConfig
+		profile   string
+		expectKey string
+	}{
+		{
+			name:      "StaticOverridesEnvironment",
+			cfg:       SDConfig{Region: "us-east-1", AccessKey: "STATIC", SecretKey: "s"},
+			expectKey: "STATIC",
+		},
+		{
+			name:      "IncompleteStaticUsesEnvironment",
+			cfg:       SDConfig{Region: "us-east-1", AccessKey: "STATIC"},
+			expectKey: "dummy",
+		},
+		{
+			name:      "ProfileCredentials",
+			cfg:       SDConfig{Region: "us-east-1", Profile: "prom"},
+			profile:   "[profile prom]\naws_access_key_id = PROFILEKEY\naws_secret_access_key = x\n",
+			expectKey: "PROFILEKEY",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			setAWSTestEnv(t)
+			if tt.profile != "" {
+				f := filepath.Join(t.TempDir(), "config")
+				require.NoError(t, os.WriteFile(f, []byte(tt.profile), 0o600))
+				t.Setenv("AWS_CONFIG_FILE", f)
+			}
+			tt.cfg.HTTPClientConfig = config.DefaultHTTPClientConfig
+			d := &Discovery{cfg: &tt.cfg}
+
+			awsCfg, err := d.newAWSCfg(context.Background())
+			require.NoError(t, err)
+			creds, err := awsCfg.Credentials.Retrieve(context.Background())
+			require.NoError(t, err)
+			require.Equal(t, tt.expectKey, creds.AccessKeyID)
+		})
+	}
+}
+
+type fakeAWSDiscovery struct {
+	groups []*targetgroup.Group
+	err    error
+}
+
+func (f fakeAWSDiscovery) refresh(context.Context) ([]*targetgroup.Group, error) {
+	return f.groups, f.err
+}
+
+func TestRefreshTargets(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name   string
+		fake   fakeAWSDiscovery
+		expErr string
+	}{
+		{
+			name: "DelegatesToRoleDiscovery",
+			fake: fakeAWSDiscovery{groups: []*targetgroup.Group{{Source: "ec2"}}},
+		},
+		{
+			name:   "PropagatesError",
+			fake:   fakeAWSDiscovery{err: errors.New("api down")},
+			expErr: "api down",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			d := &Discovery{awsDiscovery: tt.fake}
+			groups, err := d.refreshTargets(context.Background())
+			if tt.expErr != "" {
+				require.EqualError(t, err, tt.expErr)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, tt.fake.groups, groups)
+		})
+	}
+}
+
+func TestLoadRegionErrors(t *testing.T) {
+	tests := []struct {
+		name        string
+		setup       func(t *testing.T)
+		expectedErr string
+	}{
+		{
+			name: "UnknownProfile",
+			setup: func(t *testing.T) {
+				f := filepath.Join(t.TempDir(), "config")
+				require.NoError(t, os.WriteFile(f, []byte("[default]\nregion = us-east-1\n"), 0o600))
+				t.Setenv("AWS_CONFIG_FILE", f)
+				t.Setenv("AWS_PROFILE", "missing")
+			},
+			expectedErr: "failed to load AWS config",
+		},
+		{
+			name:        "IMDSUnreachable",
+			setup:       func(*testing.T) {},
+			expectedErr: "failed to get region from IMDS",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			setAWSTestEnv(t)
+			tt.setup(t)
+			_, err := loadRegion(context.Background(), "")
+			require.ErrorContains(t, err, tt.expectedErr)
+			require.ErrorContains(t, err, "could not determine AWS region")
+		})
+	}
 }
