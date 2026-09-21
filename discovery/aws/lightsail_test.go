@@ -24,9 +24,9 @@ import (
 )
 
 // newMockLightsailClient returns an adapter whose GetInstances answers with the
-// supplied instances, so refresh() can be exercised without reaching AWS.
-func newMockLightsailClient(instances []types.Instance) *lightsailClientAdapter {
-	return &lightsailClientAdapter{
+// supplied instances, so refreshAWSTargets() can be exercised without reaching AWS.
+func newMockLightsailClient(instances []types.Instance) lightsailClientAdapter {
+	return lightsailClientAdapter{
 		getInstances: func(_ context.Context, _ *lightsail.GetInstancesInput, _ ...func(*lightsail.Options)) (*lightsail.GetInstancesOutput, error) {
 			return &lightsail.GetInstancesOutput{Instances: instances}, nil
 		},
@@ -35,9 +35,11 @@ func newMockLightsailClient(instances []types.Instance) *lightsailClientAdapter 
 
 func lightsailTestDiscovery(instances []types.Instance) *LightsailDiscovery {
 	return &LightsailDiscovery{
+		Discovery: Discovery{
+			cfg:    &SDConfig{Role: RoleLightsail, Port: 8080},
+			region: "us-east-1",
+		},
 		lightsail: newMockLightsailClient(instances),
-		cfg:       &LightsailSDConfig{Port: 8080},
-		region:    "us-east-1",
 	}
 }
 

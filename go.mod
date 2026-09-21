@@ -22,7 +22,6 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/mq v1.45.6
 	github.com/aws/aws-sdk-go-v2/service/rds v1.131.0
 	github.com/aws/aws-sdk-go-v2/service/sts v1.51.4
-	github.com/aws/smithy-go v1.28.6
 	github.com/bboreham/go-loser v0.0.0-20230920113527-fcc2c21820a3
 	github.com/cespare/xxhash/v2 v2.3.0
 	github.com/dennwc/varint v1.0.0
@@ -111,6 +110,7 @@ require (
 )
 
 require (
+	github.com/aws/smithy-go v1.28.6 // indirect
 	github.com/go-openapi/swag/pools v0.29.2 // indirect
 	github.com/gofrs/flock v0.13.1 // indirect
 	github.com/hashicorp/go-metrics v0.6.0 // indirect

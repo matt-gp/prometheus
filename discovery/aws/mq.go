@@ -15,9 +15,7 @@ package aws
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"log/slog"
 	"maps"
 	"strconv"
 	"strings"
@@ -25,20 +23,11 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
-	awsConfig "github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/credentials"
-	"github.com/aws/aws-sdk-go-v2/credentials/stscreds"
 	"github.com/aws/aws-sdk-go-v2/service/mq"
 	"github.com/aws/aws-sdk-go-v2/service/mq/types"
-	"github.com/aws/aws-sdk-go-v2/service/sts"
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/common/config"
 	"github.com/prometheus/common/model"
-	"github.com/prometheus/common/promslog"
 	"golang.org/x/sync/errgroup"
 
-	"github.com/prometheus/prometheus/discovery"
-	"github.com/prometheus/prometheus/discovery/refresh"
 	"github.com/prometheus/prometheus/discovery/targetgroup"
 	"github.com/prometheus/prometheus/util/strutil"
 )
@@ -172,73 +161,14 @@ const (
 	mqLabelTags               = mqLabel + "tags_"
 )
 
-// DefaultMQSDConfig is the default MQ SD configuration.
-var DefaultMQSDConfig = MQSDConfig{
-	RefreshInterval:    model.Duration(60 * time.Second),
-	RequestConcurrency: 10,
-	HTTPClientConfig:   config.DefaultHTTPClientConfig,
+// MQDiscovery periodically performs MQ-SD requests. It implements
+// the Discoverer interface.
+type MQDiscovery struct {
+	Discovery
+	mq mqClientAdapter
 }
 
-func init() {
-	discovery.RegisterConfig(&MQSDConfig{})
-}
-
-// MQSDConfig is the configuration for MQ based service discovery.
-type MQSDConfig struct {
-	Region          string         `yaml:"region"`
-	Endpoint        string         `yaml:"endpoint"`
-	AccessKey       string         `yaml:"access_key,omitempty"`
-	SecretKey       config.Secret  `yaml:"secret_key,omitempty"`
-	Profile         string         `yaml:"profile,omitempty"`
-	RoleARN         string         `yaml:"role_arn,omitempty"`
-	ExternalID      string         `yaml:"external_id,omitempty"`
-	RefreshInterval model.Duration `yaml:"refresh_interval,omitempty"`
-
-	RequestConcurrency int                     `yaml:"request_concurrency,omitempty"`
-	HTTPClientConfig   config.HTTPClientConfig `yaml:",inline"`
-}
-
-// NewDiscovererMetrics implements discovery.Config.
-func (*MQSDConfig) NewDiscovererMetrics(_ prometheus.Registerer, rmi discovery.RefreshMetricsInstantiator) discovery.DiscovererMetrics {
-	return &mqMetrics{
-		refreshMetrics: rmi,
-	}
-}
-
-// Name returns the name of the MQ Config.
-func (*MQSDConfig) Name() string { return "mq" }
-
-// NewDiscoverer returns a Discoverer for the MQ Config.
-func (c *MQSDConfig) NewDiscoverer(opts discovery.DiscovererOptions) (discovery.Discoverer, error) {
-	return NewMQDiscovery(c, opts)
-}
-
-// SetDirectory joins any relative file paths with dir.
-func (c *MQSDConfig) SetDirectory(dir string) {
-	c.HTTPClientConfig.SetDirectory(dir)
-}
-
-// UnmarshalYAML implements the yaml.Unmarshaler interface for the MQ Config.
-// Region resolution is deferred to initMqClient; see loadRegion.
-func (c *MQSDConfig) UnmarshalYAML(unmarshal func(any) error) error {
-	*c = DefaultMQSDConfig
-	type plain MQSDConfig
-	err := unmarshal((*plain)(c))
-	if err != nil {
-		return err
-	}
-
-	if c.RequestConcurrency <= 0 {
-		return fmt.Errorf("mq_sd: request_concurrency must be positive, got %d", c.RequestConcurrency)
-	}
-
-	return c.HTTPClientConfig.Validate()
-}
-
-type mqClient interface {
-	DescribeBroker(context.Context, *mq.DescribeBrokerInput, ...func(*mq.Options)) (*mq.DescribeBrokerOutput, error)
-	ListBrokers(context.Context, *mq.ListBrokersInput, ...func(*mq.Options)) (*mq.ListBrokersOutput, error)
-}
+var _ awsDiscovery = (*MQDiscovery)(nil)
 
 // mqClientAdapter captures only the MQ API calls AWS discovery uses
 // as method-value closures, keeping the concrete *mq.Client out of any
@@ -263,112 +193,29 @@ func (a mqClientAdapter) ListBrokers(ctx context.Context, params *mq.ListBrokers
 	return a.listBrokers(ctx, params, optFns...)
 }
 
-// MQDiscovery periodically performs MQ-SD requests. It implements
-// the Discoverer interface.
-type MQDiscovery struct {
-	*refresh.Discovery
-	logger *slog.Logger
-	cfg    *MQSDConfig
-	mq     mqClient
-
-	// region is the resolved region used for the AWS client and for the
-	// Source label. Lazily populated by initMqClient.
-	region string
-}
-
-// NewMQDiscovery returns a new MQDiscovery which periodically refreshes its targets.
-func NewMQDiscovery(conf *MQSDConfig, opts discovery.DiscovererOptions) (*MQDiscovery, error) {
-	m, ok := opts.Metrics.(*mqMetrics)
-	if !ok {
-		return nil, errors.New("invalid discovery metrics type")
-	}
-
-	if opts.Logger == nil {
-		opts.Logger = promslog.NewNopLogger()
-	}
-	d := &MQDiscovery{
-		logger: opts.Logger,
-		cfg:    conf,
-	}
-	d.Discovery = refresh.NewDiscovery(
-		refresh.Options{
-			Logger:              opts.Logger,
-			Mech:                "mq",
-			Interval:            time.Duration(d.cfg.RefreshInterval),
-			RefreshF:            d.refresh,
-			MetricsInstantiator: m.refreshMetrics,
-		},
-	)
-	return d, nil
-}
-
-func (d *MQDiscovery) initMqClient(ctx context.Context) error {
-	if d.mq != nil {
-		return nil
-	}
-
-	// Build the HTTP client from the provided HTTPClientConfig.
-	client, err := config.NewClientFromConfig(d.cfg.HTTPClientConfig, "mq_sd")
-	if err != nil {
-		return err
-	}
-
-	// Resolve the region lazily. See MQSDConfig.UnmarshalYAML.
-	d.region, err = loadRegion(ctx, d.cfg.Region)
-	if err != nil {
-		return err
-	}
-
-	// Build the AWS config with the resolved region.
-	var configOptions []func(*awsConfig.LoadOptions) error
-	configOptions = append(configOptions, awsConfig.WithRegion(d.region))
-	configOptions = append(configOptions, awsConfig.WithHTTPClient(client))
-
-	// Only set static credentials if both access key and secret key are provided
-	// Otherwise, let AWS SDK use its default credential chain.
-	if d.cfg.AccessKey != "" && d.cfg.SecretKey != "" {
-		credProvider := credentials.NewStaticCredentialsProvider(d.cfg.AccessKey, string(d.cfg.SecretKey), "")
-		configOptions = append(configOptions, awsConfig.WithCredentialsProvider(credProvider))
-	}
-
-	if d.cfg.Profile != "" {
-		configOptions = append(configOptions, awsConfig.WithSharedConfigProfile(d.cfg.Profile))
-	}
-
-	cfg, err := awsConfig.LoadDefaultConfig(ctx, configOptions...)
-	if err != nil {
-		d.logger.Error("Failed to create AWS config", "error", err)
-		return fmt.Errorf("could not create aws config: %w", err)
-	}
-
-	// If the role ARN is set, assume the role to get credentials and set the credentials provider in the config.
-	if d.cfg.RoleARN != "" {
-		assumeProvider := stscreds.NewAssumeRoleProvider(sts.NewFromConfig(cfg), d.cfg.RoleARN, func(o *stscreds.AssumeRoleOptions) {
-			if d.cfg.ExternalID != "" {
-				o.ExternalID = aws.String(d.cfg.ExternalID)
-			}
-		})
-		cfg.Credentials = aws.NewCredentialsCache(assumeProvider)
-	}
-
-	d.mq = newMQClientAdapter(mq.NewFromConfig(cfg, func(options *mq.Options) {
+// newMQDiscovery returns a new MQDiscovery which periodically refreshes its targets.
+func newMQDiscovery(ctx context.Context, cfg aws.Config, d *Discovery) (*MQDiscovery, error) {
+	clientAdapter := newMQClientAdapter(mq.NewFromConfig(cfg, func(options *mq.Options) {
 		if d.cfg.Endpoint != "" {
 			options.BaseEndpoint = &d.cfg.Endpoint
 		}
-		options.HTTPClient = client
+		options.HTTPClient = cfg.HTTPClient
 	}))
 
+	// Test credentials by making a simple API call
 	// Test credentials by making a simple API call.
 	testCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
-	_, err = d.mq.ListBrokers(testCtx, &mq.ListBrokersInput{})
+	_, err := clientAdapter.ListBrokers(testCtx, &mq.ListBrokersInput{})
 	if err != nil {
-		d.logger.Error("Failed to test MQ credentials", "error", err)
-		return fmt.Errorf("MQ credential test failed: %w", err)
+		return nil, fmt.Errorf("msk credential test failed: %w", err)
 	}
 
-	return nil
+	return &MQDiscovery{
+		Discovery: *d,
+		mq:        clientAdapter,
+	}, nil
 }
 
 // describeBrokers describes the brokers with the given broker IDs concurrently,
@@ -425,10 +272,6 @@ func (d *MQDiscovery) listBrokers(ctx context.Context) ([]string, error) {
 }
 
 func (d *MQDiscovery) refresh(ctx context.Context) ([]*targetgroup.Group, error) {
-	err := d.initMqClient(ctx)
-	if err != nil {
-		return nil, err
-	}
 
 	tg := &targetgroup.Group{
 		Source: d.region,

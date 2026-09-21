@@ -15,6 +15,7 @@ package aws
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"maps"
 	"sort"
@@ -444,14 +445,21 @@ func TestMQDiscoveryRefresh(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
+			client := newMockMQClient(tt.mqData)
 			d := &MQDiscovery{
-				mq:     newMockMQClient(tt.mqData),
-				logger: promslog.NewNopLogger(),
-				cfg: &MQSDConfig{
-					Region:             tt.mqData.region,
-					RequestConcurrency: 10,
+				Discovery: Discovery{
+					logger: promslog.NewNopLogger(),
+					cfg: &SDConfig{
+						Role:               RoleMQ,
+						Region:             tt.mqData.region,
+						RequestConcurrency: 10,
+					},
+					region: tt.mqData.region,
 				},
-				region: tt.mqData.region,
+				mq: mqClientAdapter{
+					describeBroker: client.DescribeBroker,
+					listBrokers:    client.ListBrokers,
+				},
 			}
 
 			groups, err := d.refresh(ctx)
@@ -516,4 +524,208 @@ func (m *mockMQClient) ListBrokers(_ context.Context, _ *mq.ListBrokersInput, _ 
 	return &mq.ListBrokersOutput{
 		BrokerSummaries: summaries,
 	}, nil
+}
+
+func TestMQDiscoveryAPIErrors(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	apiErr := errors.New("api down")
+
+	tests := []struct {
+		name        string
+		adapter     mqClientAdapter
+		expectedErr string
+	}{
+		{
+			name: "ListBrokersFails",
+			adapter: mqClientAdapter{
+				listBrokers: func(context.Context, *mq.ListBrokersInput, ...func(*mq.Options)) (*mq.ListBrokersOutput, error) {
+					return nil, apiErr
+				},
+			},
+			expectedErr: "error listing brokers: api down",
+		},
+		{
+			name: "ListBrokersFailsOnSecondPage",
+			adapter: mqClientAdapter{
+				listBrokers: func(_ context.Context, in *mq.ListBrokersInput, _ ...func(*mq.Options)) (*mq.ListBrokersOutput, error) {
+					if in.NextToken == nil {
+						return &mq.ListBrokersOutput{
+							BrokerSummaries: []types.BrokerSummary{{BrokerId: aws.String("b-1")}},
+							NextToken:       aws.String("page2"),
+						}, nil
+					}
+					return nil, apiErr
+				},
+			},
+			expectedErr: "error listing brokers: api down",
+		},
+		{
+			name: "DescribeBrokerFails",
+			adapter: mqClientAdapter{
+				listBrokers: func(context.Context, *mq.ListBrokersInput, ...func(*mq.Options)) (*mq.ListBrokersOutput, error) {
+					return &mq.ListBrokersOutput{BrokerSummaries: []types.BrokerSummary{{BrokerId: aws.String("b-1")}}}, nil
+				},
+				describeBroker: func(context.Context, *mq.DescribeBrokerInput, ...func(*mq.Options)) (*mq.DescribeBrokerOutput, error) {
+					return nil, apiErr
+				},
+			},
+			expectedErr: "error describing brokers: error describing broker b-1: api down",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			d := &MQDiscovery{
+				Discovery: Discovery{
+					logger: promslog.NewNopLogger(),
+					cfg:    &SDConfig{Role: RoleMQ, RequestConcurrency: 2},
+					region: "us-east-1",
+				},
+				mq: tt.adapter,
+			}
+			groups, err := d.refresh(ctx)
+			require.EqualError(t, err, tt.expectedErr)
+			require.Nil(t, groups)
+		})
+	}
+}
+
+func TestMQDiscoveryListBrokersPagination(t *testing.T) {
+	t.Parallel()
+
+	pages := map[string]*mq.ListBrokersOutput{
+		"":      {BrokerSummaries: []types.BrokerSummary{{BrokerId: aws.String("b-1")}, {BrokerId: aws.String("b-2")}}, NextToken: aws.String("p2")},
+		"p2":    {BrokerSummaries: []types.BrokerSummary{{BrokerId: aws.String("b-3")}}, NextToken: aws.String("p3")},
+		"p3":    {BrokerSummaries: nil},
+		"other": nil,
+	}
+	var calls int
+	d := &MQDiscovery{
+		Discovery: Discovery{cfg: &SDConfig{RequestConcurrency: 1}},
+		mq: mqClientAdapter{
+			listBrokers: func(_ context.Context, in *mq.ListBrokersInput, _ ...func(*mq.Options)) (*mq.ListBrokersOutput, error) {
+				calls++
+				require.Equal(t, int32(100), aws.ToInt32(in.MaxResults))
+				return pages[aws.ToString(in.NextToken)], nil
+			},
+		},
+	}
+
+	ids, err := d.listBrokers(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, []string{"b-1", "b-2", "b-3"}, ids)
+	require.Equal(t, 3, calls)
+}
+
+func TestMQLabelHelpers(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		got      model.LabelSet
+		expected model.LabelSet
+	}{
+		{
+			name:     "ConfigurationsNil",
+			got:      mqConfigurationLabels(nil),
+			expected: model.LabelSet{},
+		},
+		{
+			name:     "ConfigurationsCurrentEmpty",
+			got:      mqConfigurationLabels(&types.Configurations{Current: &types.ConfigurationId{}}),
+			expected: model.LabelSet{},
+		},
+		{
+			name: "ConfigurationsCurrent",
+			got:  mqConfigurationLabels(&types.Configurations{Current: &types.ConfigurationId{Id: aws.String("c-1"), Revision: aws.Int32(3)}}),
+			expected: model.LabelSet{
+				mqLabelConfigurationsCurrentID:       "c-1",
+				mqLabelConfigurationsCurrentRevision: "3",
+			},
+		},
+		{
+			name:     "EncryptionNil",
+			got:      mqEncryptionOptionsLabels(nil),
+			expected: model.LabelSet{},
+		},
+		{
+			name:     "EncryptionEmpty",
+			got:      mqEncryptionOptionsLabels(&types.EncryptionOptions{}),
+			expected: model.LabelSet{},
+		},
+		{
+			name: "EncryptionFull",
+			got:  mqEncryptionOptionsLabels(&types.EncryptionOptions{UseAwsOwnedKey: aws.Bool(false), KmsKeyId: aws.String("key-1")}),
+			expected: model.LabelSet{
+				mqLabelEncryptionOptionsUseAwsOwned: "false",
+				mqLabelEncryptionOptionsKmsKeyID:    "key-1",
+			},
+		},
+		{
+			name:     "MaintenanceWindowNil",
+			got:      mqMaintenanceWindowStartTimeLabels(nil),
+			expected: model.LabelSet{},
+		},
+		{
+			name:     "MaintenanceWindowEmpty",
+			got:      mqMaintenanceWindowStartTimeLabels(&types.WeeklyStartTime{}),
+			expected: model.LabelSet{},
+		},
+		{
+			name: "MaintenanceWindowFull",
+			got: mqMaintenanceWindowStartTimeLabels(&types.WeeklyStartTime{
+				DayOfWeek: types.DayOfWeekMonday,
+				TimeOfDay: aws.String("02:00"),
+				TimeZone:  aws.String("UTC"),
+			}),
+			expected: model.LabelSet{
+				mqLabelMaintenanceWindowStartTimeDayOfWeek: "MONDAY",
+				mqLabelMaintenanceWindowStartTimeTimeOfDay: "02:00",
+				mqLabelMaintenanceWindowStartTimeTimeZone:  "UTC",
+			},
+		},
+		{
+			name:     "DataReplicationNil",
+			got:      mqDataReplicationMetadataLabels(nil, false),
+			expected: model.LabelSet{},
+		},
+		{
+			name: "DataReplicationCurrent",
+			got: mqDataReplicationMetadataLabels(&types.DataReplicationMetadataOutput{
+				DataReplicationRole:        aws.String("LEADER"),
+				DataReplicationCounterpart: &types.DataReplicationCounterpart{BrokerId: aws.String("b-2"), Region: aws.String("eu-west-1")},
+			}, false),
+			expected: model.LabelSet{
+				mqLabelDataReplicationMetadataDataReplicationRole:                "LEADER",
+				mqLabelDataReplicationMetadataDataReplicationCounterpartBrokerID: "b-2",
+				mqLabelDataReplicationMetadataDataReplicationCounterpartRegion:   "eu-west-1",
+			},
+		},
+		{
+			name: "DataReplicationPending",
+			got: mqDataReplicationMetadataLabels(&types.DataReplicationMetadataOutput{
+				DataReplicationRole:        aws.String("FOLLOWER"),
+				DataReplicationCounterpart: &types.DataReplicationCounterpart{BrokerId: aws.String("b-3"), Region: aws.String("us-east-2")},
+			}, true),
+			expected: model.LabelSet{
+				mqLabelPendingDataReplicationMetadataDataReplicationRole:                "FOLLOWER",
+				mqLabelPendingDataReplicationMetadataDataReplicationCounterpartBrokerID: "b-3",
+				mqLabelPendingDataReplicationMetadataDataReplicationCounterpartRegion:   "us-east-2",
+			},
+		},
+		{
+			name:     "LdapNil",
+			got:      mqLdapServerMetadataLabels(nil, false),
+			expected: model.LabelSet{},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			require.Equal(t, tt.expected, tt.got)
+		})
+	}
 }
