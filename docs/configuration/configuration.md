@@ -1815,91 +1815,6 @@ names:
 [ refresh_interval: <duration> | default = 30s ]
 ```
 
-### `<ec2_sd_config>`
-
-EC2 SD configurations allow retrieving scrape targets from AWS EC2
-instances. The private IP address is used by default, but may be changed to
-the public IP address with relabeling.
-
-The IAM credentials used must have the `ec2:DescribeInstances` permission to
-discover scrape targets, and may optionally have the
-`ec2:DescribeAvailabilityZones` permission if you want the availability zone ID
-available as a label (see below).
-
-The following meta labels are available on targets during [relabeling](#relabel_config):
-
-* `__meta_ec2_ami`: the EC2 Amazon Machine Image
-* `__meta_ec2_architecture`: the architecture of the instance
-* `__meta_ec2_availability_zone`: the availability zone in which the instance is running
-* `__meta_ec2_availability_zone_id`: the [availability zone ID](https://docs.aws.amazon.com/ram/latest/userguide/working-with-az-ids.html) in which the instance is running (requires `ec2:DescribeAvailabilityZones`)
-* `__meta_ec2_instance_id`: the EC2 instance ID
-* `__meta_ec2_instance_lifecycle`: the lifecycle of the EC2 instance, set only for 'spot' or 'scheduled' instances, absent otherwise
-* `__meta_ec2_instance_state`: the state of the EC2 instance
-* `__meta_ec2_instance_type`: the type of the EC2 instance
-* `__meta_ec2_ipv6_addresses`: comma separated list of IPv6 addresses assigned to the instance's network interfaces, if present
-* `__meta_ec2_owner_id`: the ID of the AWS account that owns the EC2 instance
-* `__meta_ec2_platform`: the Operating System platform, set to 'windows' on Windows servers, absent otherwise
-* `__meta_ec2_default_ipv6_address`: the first primary IPv6 address found if present, otherwise first non-primary IPv6 address, if present
-* `__meta_ec2_primary_ipv6_addresses`: comma separated list of the Primary IPv6 addresses of the instance, if present. The list is ordered based on the position of each corresponding network interface in the attachment order.
-* `__meta_ec2_primary_subnet_id`: the subnet ID of the primary network interface, if available
-* `__meta_ec2_private_dns_name`: the private DNS name of the instance, if available
-* `__meta_ec2_private_ip`: the private IP address of the instance, if present
-* `__meta_ec2_public_dns_name`: the public DNS name of the instance, if available
-* `__meta_ec2_public_ip`: the public IP address of the instance, if available
-* `__meta_ec2_region`: the region of the instance
-* `__meta_ec2_subnet_id`: comma separated list of subnets IDs in which the instance is running, if available
-* `__meta_ec2_tag_<tagkey>`: each tag value of the instance
-* `__meta_ec2_vpc_id`: the ID of the VPC in which the instance is running, if available
-
-See below for the configuration options for EC2 discovery:
-
-```yaml
-# The information to access the EC2 API.
-
-# The AWS region. If blank, the region from the instance metadata is used.
-[ region: <string> ]
-
-# Custom endpoint to be used.
-[ endpoint: <string> ]
-
-# The AWS API keys. If blank, the environment variables `AWS_ACCESS_KEY_ID`
-# and `AWS_SECRET_ACCESS_KEY` are used.
-[ access_key: <string> ]
-[ secret_key: <secret> ]
-# Named AWS profile used to connect to the API.
-[ profile: <string> ]
-
-# AWS Role ARN, an alternative to using AWS API keys.
-[ role_arn: <string> ]
-
-# Optional External ID that can go along with role_arn.
-[ external_id: <string> ]
-
-# Refresh interval to re-read the instance list.
-[ refresh_interval: <duration> | default = 60s ]
-
-# The port to scrape metrics from. If using the public IP address, this must
-# instead be specified in the relabeling rule.
-[ port: <int> | default = 80 ]
-
-# Filters can be used optionally to filter the instance list by other criteria.
-# Available filter criteria can be found here:
-# https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_DescribeInstances.html
-# Filter API documentation: https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_Filter.html
-filters:
-  [ - name: <string>
-      values: <string>, [...] ]
-
-# HTTP client settings, including authentication methods (such as basic auth and
-# authorization), proxy configurations, TLS options, custom HTTP headers, etc.
-[ <http_config> ]
-```
-
-The [relabeling phase](#relabel_config) is the preferred and more powerful
-way to filter targets based on arbitrary labels. For users with thousands of
-instances it can be more efficient to use the EC2 API directly which has
-support for filtering instances.
-
 ### `<openstack_sd_config>`
 
 OpenStack SD configurations allow retrieving scrape targets from OpenStack Nova
@@ -2718,62 +2633,6 @@ server: <string>
 
 The [relabeling phase](#relabel_config) is the preferred and more powerful way
 to filter proxies and user-defined tags.
-
-### `<lightsail_sd_config>`
-
-Lightsail SD configurations allow retrieving scrape targets from [AWS Lightsail](https://aws.amazon.com/lightsail/)
-instances. The private IP address is used by default, but may be changed to
-the public IP address with relabeling.
-
-The following meta labels are available on targets during [relabeling](#relabel_config):
-
-* `__meta_lightsail_availability_zone`: the availability zone in which the instance is running
-* `__meta_lightsail_blueprint_id`: the Lightsail blueprint ID
-* `__meta_lightsail_bundle_id`: the Lightsail bundle ID
-* `__meta_lightsail_instance_name`: the name of the Lightsail instance
-* `__meta_lightsail_instance_state`: the state of the Lightsail instance
-* `__meta_lightsail_instance_support_code`: the support code of the Lightsail instance
-* `__meta_lightsail_ipv6_addresses`: comma separated list of IPv6 addresses assigned to the instance's network interfaces, if present
-* `__meta_lightsail_private_ip`: the private IP address of the instance
-* `__meta_lightsail_public_ip`: the public IP address of the instance, if available
-* `__meta_lightsail_region`: the region of the instance
-* `__meta_lightsail_tag_<tagkey>`: each tag value of the instance
-
-See below for the configuration options for Lightsail discovery:
-
-```yaml
-# The information to access the Lightsail API.
-
-# The AWS region. If blank, the region from the instance metadata is used.
-[ region: <string> ]
-
-# Custom endpoint to be used.
-[ endpoint: <string> ]
-
-# The AWS API keys. If blank, the environment variables `AWS_ACCESS_KEY_ID`
-# and `AWS_SECRET_ACCESS_KEY` are used.
-[ access_key: <string> ]
-[ secret_key: <secret> ]
-# Named AWS profile used to connect to the API.
-[ profile: <string> ]
-
-# AWS Role ARN, an alternative to using AWS API keys.
-[ role_arn: <string> ]
-
-# Optional External ID that can go along with role_arn.
-[ external_id: <string> ]
-
-# Refresh interval to re-read the instance list.
-[ refresh_interval: <duration> | default = 60s ]
-
-# The port to scrape metrics from. If using the public IP address, this must
-# instead be specified in the relabeling rule.
-[ port: <int> | default = 80 ]
-
-# HTTP client settings, including authentication methods (such as basic auth and
-# authorization), proxy configurations, TLS options, custom HTTP headers, etc.
-[ <http_config> ]
-```
 
 ### `<linode_sd_config>`
 
@@ -3785,10 +3644,6 @@ consul_sd_configs:
 dns_sd_configs:
   [ - <dns_sd_config> ... ]
 
-# List of EC2 service discovery configurations.
-ec2_sd_configs:
-  [ - <ec2_sd_config> ... ]
-
 # List of Eureka service discovery configurations.
 eureka_sd_configs:
   [ - <eureka_sd_config> ... ]
@@ -3828,10 +3683,6 @@ ionos_sd_configs:
 # List of Kubernetes service discovery configurations.
 kubernetes_sd_configs:
   [ - <kubernetes_sd_config> ... ]
-
-# List of Lightsail service discovery configurations.
-lightsail_sd_configs:
-  [ - <lightsail_sd_config> ... ]
 
 # List of Linode service discovery configurations.
 linode_sd_configs:

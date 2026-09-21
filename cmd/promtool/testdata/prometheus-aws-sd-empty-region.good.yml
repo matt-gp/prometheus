@@ -5,20 +5,26 @@
 
 scrape_configs:
   - job_name: 'ec2'
-    ec2_sd_configs:
-      - port: 9090
+    aws_sd_configs:
+      - role: ec2
+        port: 9090
   - job_name: 'ecs'
-    ecs_sd_configs:
-      - port: 9090
+    aws_sd_configs:
+      - role: ecs
+        port: 9090
   - job_name: 'rds'
-    rds_sd_configs:
-      - port: 9090
+    aws_sd_configs:
+      - role: rds
+        port: 9090
   - job_name: 'msk'
-    msk_sd_configs:
-      - port: 9090
+    aws_sd_configs:
+      - role: msk
+        port: 9090
   - job_name: 'elasticache'
-    elasticache_sd_configs:
-      - port: 9090
+    aws_sd_configs:
+      - role: elasticache
+        port: 9090
   - job_name: 'lightsail'
-    lightsail_sd_configs:
-      - port: 9090
+    aws_sd_configs:
+      - role: lightsail
+        port: 9090

@@ -55,7 +55,18 @@ func TestMain(m *testing.M) {
 	goleak.VerifyTestMain(m)
 }
 
-func TestEC2DiscoveryRefreshAZIDs(t *testing.T) {
+// mockEC2ClientAdapter wires a mockEC2Client's method values into an
+// ec2ClientAdapter, the same way newEC2ClientAdapter does for a real
+// *ec2.Client. DescribeNetworkInterfaces is left nil since mockEC2Client
+// does not implement it and refreshAWSTargets never calls it.
+func mockEC2ClientAdapter(client *mockEC2Client) ec2ClientAdapter {
+	return ec2ClientAdapter{
+		describeAvailabilityZones: client.DescribeAvailabilityZones,
+		describeInstances:         client.DescribeInstances,
+	}
+}
+
+func TestEC2RefresherRefreshAZIDs(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 
@@ -86,7 +97,7 @@ func TestEC2DiscoveryRefreshAZIDs(t *testing.T) {
 			client := newMockEC2Client(tt.ec2Data)
 
 			d := &EC2Discovery{
-				ec2: client,
+				ec2: mockEC2ClientAdapter(client),
 			}
 
 			err := d.refreshAZIDs(ctx)
@@ -100,7 +111,7 @@ func TestEC2DiscoveryRefreshAZIDs(t *testing.T) {
 	}
 }
 
-func TestEC2DiscoveryRefresh(t *testing.T) {
+func TestEC2RefresherRefreshAWSTargets(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 
@@ -511,13 +522,17 @@ func TestEC2DiscoveryRefresh(t *testing.T) {
 			client := newMockEC2Client(tt.ec2Data)
 
 			d := &EC2Discovery{
-				ec2: client,
-				cfg: &EC2SDConfig{
-					Port:    4242,
-					Region:  client.ec2Data.region,
-					Filters: tt.filters,
+				Discovery: Discovery{
+					logger: promslog.NewNopLogger(),
+					cfg: &SDConfig{
+						Role:    RoleEC2,
+						Port:    4242,
+						Region:  client.ec2Data.region,
+						Filters: tt.filters,
+					},
+					region: client.ec2Data.region,
 				},
-				region: client.ec2Data.region,
+				ec2: mockEC2ClientAdapter(client),
 			}
 
 			g, err := d.refresh(ctx)
@@ -560,18 +575,21 @@ func (m *mockEC2Client) DescribeAvailabilityZones(context.Context, *ec2.Describe
 	}, nil
 }
 
-// ec2TestDiscovery returns a discovery backed by the mock client, so refresh()
-// can be exercised without reaching AWS. ec2Client returns early when ec2 is
-// already set, which also leaves region unset, so it is populated here.
-func ec2TestDiscovery(data *ec2DataStore) *EC2Discovery {
+// ec2TestRefresher returns an EC2Discovery backed by the mock client, so
+// refresh() can be exercised without reaching AWS.
+func ec2TestRefresher(data *ec2DataStore) *EC2Discovery {
+	client := newMockEC2Client(data)
 	return &EC2Discovery{
-		logger: promslog.NewNopLogger(),
-		ec2:    newMockEC2Client(data),
-		cfg: &EC2SDConfig{
-			Port:   4242,
-			Region: data.region,
+		Discovery: Discovery{
+			logger: promslog.NewNopLogger(),
+			cfg: &SDConfig{
+				Role:   RoleEC2,
+				Port:   4242,
+				Region: data.region,
+			},
+			region: data.region,
 		},
-		region: data.region,
+		ec2: mockEC2ClientAdapter(client),
 	}
 }
 
@@ -622,12 +640,13 @@ func fullyPopulatedEC2DataStore() *ec2DataStore {
 	}
 }
 
-// TestEC2DiscoveryRefreshFullyPopulated pins the happy path so the nil handling
-// added for the cases below cannot silently drop labels that used to be set.
-func TestEC2DiscoveryRefreshFullyPopulated(t *testing.T) {
+// TestEC2RefresherRefreshAWSTargetsFullyPopulated pins the happy path so the
+// nil handling added for the cases below cannot silently drop labels that
+// used to be set.
+func TestEC2RefresherRefreshAWSTargetsFullyPopulated(t *testing.T) {
 	t.Parallel()
 
-	tgs, err := ec2TestDiscovery(fullyPopulatedEC2DataStore()).refresh(context.Background())
+	tgs, err := ec2TestRefresher(fullyPopulatedEC2DataStore()).refresh(context.Background())
 	require.NoError(t, err)
 	require.Equal(t, []*targetgroup.Group{
 		{
@@ -662,12 +681,13 @@ func TestEC2DiscoveryRefreshFullyPopulated(t *testing.T) {
 	}, tgs)
 }
 
-// TestEC2DiscoveryRefreshInstanceNilOptionalFields covers instances where the
-// AWS API omitted an optional field. None of these members are marked required
-// by the SDK, yet refresh() dereferenced them without a nil check, so a single
-// missing field panicked the whole Prometheus process during service discovery
-// rather than degrading the target.
-func TestEC2DiscoveryRefreshInstanceNilOptionalFields(t *testing.T) {
+// TestEC2RefresherRefreshAWSTargetsInstanceNilOptionalFields covers instances
+// where the AWS API omitted an optional field. None of these members are
+// marked required by the SDK, yet refreshAWSTargets() dereferenced them
+// without a nil check, so a single missing field panicked the whole
+// Prometheus process during service discovery rather than degrading the
+// target.
+func TestEC2RefresherRefreshAWSTargetsInstanceNilOptionalFields(t *testing.T) {
 	t.Parallel()
 
 	for _, tc := range []struct {
@@ -717,7 +737,7 @@ func TestEC2DiscoveryRefreshInstanceNilOptionalFields(t *testing.T) {
 			data := fullyPopulatedEC2DataStore()
 			tc.mutate(&data.instances[0])
 
-			tgs, err := ec2TestDiscovery(data).refresh(context.Background())
+			tgs, err := ec2TestRefresher(data).refresh(context.Background())
 			require.NoError(t, err)
 			require.Len(t, tgs, 1)
 			require.Len(t, tgs[0].Targets, 1,
@@ -734,12 +754,13 @@ func TestEC2DiscoveryRefreshInstanceNilOptionalFields(t *testing.T) {
 	}
 }
 
-// TestEC2DiscoveryRefreshIPv6NilOptionalFields covers the IPv6 fields
-// getInstanceIPv6Addresses dereferenced without a nil check. IsPrimaryIpv6 is
-// only populated once a primary IPv6 address has been enabled on the interface,
-// and the attachment device index is optional too, so an instance holding a
-// plain IPv6 address was enough to panic the process.
-func TestEC2DiscoveryRefreshIPv6NilOptionalFields(t *testing.T) {
+// TestEC2RefresherRefreshAWSTargetsIPv6NilOptionalFields covers the IPv6
+// fields getInstanceIPv6Addresses dereferenced without a nil check.
+// IsPrimaryIpv6 is only populated once a primary IPv6 address has been
+// enabled on the interface, and the attachment device index is optional too,
+// so an instance holding a plain IPv6 address was enough to panic the
+// process.
+func TestEC2RefresherRefreshAWSTargetsIPv6NilOptionalFields(t *testing.T) {
 	t.Parallel()
 
 	for _, tc := range []struct {
@@ -809,7 +830,7 @@ func TestEC2DiscoveryRefreshIPv6NilOptionalFields(t *testing.T) {
 			data := fullyPopulatedEC2DataStore()
 			tc.mutate(&data.instances[0].NetworkInterfaces[0])
 
-			tgs, err := ec2TestDiscovery(data).refresh(context.Background())
+			tgs, err := ec2TestRefresher(data).refresh(context.Background())
 			require.NoError(t, err)
 			require.Len(t, tgs, 1)
 			require.Len(t, tgs[0].Targets, 1,

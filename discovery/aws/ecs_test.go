@@ -40,7 +40,39 @@ type ecsDataStore struct {
 	eniPublicIPs       map[string]string          // ENI ID to public IP
 }
 
-func TestECSDiscoveryListClusterARNs(t *testing.T) {
+// newTestECSRefresher builds an *ECSRefresher wired to the given mock clients,
+// bypassing newECSRefresher (which builds real SDK clients and makes a live
+// "test credentials" API call). Either mock client may be nil when a test
+// only exercises the ECS or the EC2 side of the refresher.
+func newTestECSRefresher(cfg *SDConfig, ecsClient *mockECSClient, ec2Client *mockECSEC2Client) *ECSDiscovery {
+	d := &ECSDiscovery{
+		Discovery: Discovery{
+			cfg:    cfg,
+			region: cfg.Region,
+			logger: promslog.NewNopLogger(),
+		},
+	}
+	if ecsClient != nil {
+		d.ecs = ecsClientAdapter{
+			listClusters:               ecsClient.ListClusters,
+			describeClusters:           ecsClient.DescribeClusters,
+			listServices:               ecsClient.ListServices,
+			describeServices:           ecsClient.DescribeServices,
+			listTasks:                  ecsClient.ListTasks,
+			describeTasks:              ecsClient.DescribeTasks,
+			describeContainerInstances: ecsClient.DescribeContainerInstances,
+		}
+	}
+	if ec2Client != nil {
+		d.ec2 = ec2ClientAdapter{
+			describeInstances:         ec2Client.DescribeInstances,
+			describeNetworkInterfaces: ec2Client.DescribeNetworkInterfaces,
+		}
+	}
+	return d
+}
+
+func TestECSRefresherListClusterARNs(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 
@@ -100,13 +132,11 @@ func TestECSDiscoveryListClusterARNs(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			client := newMockECSClient(tt.ecsData)
 
-			d := &ECSDiscovery{
-				ecs: client,
-				cfg: &ECSSDConfig{
-					Region:             tt.ecsData.region,
-					RequestConcurrency: 10,
-				},
-			}
+			d := newTestECSRefresher(&SDConfig{
+				Role:               RoleECS,
+				Region:             tt.ecsData.region,
+				RequestConcurrency: 10,
+			}, client, nil)
 
 			clusters, err := d.listClusterARNs(ctx)
 			require.NoError(t, err)
@@ -115,7 +145,7 @@ func TestECSDiscoveryListClusterARNs(t *testing.T) {
 	}
 }
 
-func TestECSDiscoveryDescribeClusters(t *testing.T) {
+func TestECSRefresherDescribeClusters(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 
@@ -199,13 +229,11 @@ func TestECSDiscoveryDescribeClusters(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			client := newMockECSClient(tt.ecsData)
 
-			d := &ECSDiscovery{
-				ecs: client,
-				cfg: &ECSSDConfig{
-					Region:             tt.ecsData.region,
-					RequestConcurrency: 10,
-				},
-			}
+			d := newTestECSRefresher(&SDConfig{
+				Role:               RoleECS,
+				Region:             tt.ecsData.region,
+				RequestConcurrency: 10,
+			}, client, nil)
 
 			clusterMap, err := d.describeClusters(ctx, tt.clusterARNs)
 			require.NoError(t, err)
@@ -214,7 +242,7 @@ func TestECSDiscoveryDescribeClusters(t *testing.T) {
 	}
 }
 
-func TestECSDiscoveryListServiceARNs(t *testing.T) {
+func TestECSRefresherListServiceARNs(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 
@@ -298,13 +326,11 @@ func TestECSDiscoveryListServiceARNs(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			client := newMockECSClient(tt.ecsData)
 
-			d := &ECSDiscovery{
-				ecs: client,
-				cfg: &ECSSDConfig{
-					Region:             tt.ecsData.region,
-					RequestConcurrency: 2,
-				},
-			}
+			d := newTestECSRefresher(&SDConfig{
+				Role:               RoleECS,
+				Region:             tt.ecsData.region,
+				RequestConcurrency: 2,
+			}, client, nil)
 
 			serviceMap, err := d.listServiceARNs(ctx, tt.clusterARNs)
 			require.NoError(t, err)
@@ -313,7 +339,7 @@ func TestECSDiscoveryListServiceARNs(t *testing.T) {
 	}
 }
 
-func TestECSDiscoveryDescribeServices(t *testing.T) {
+func TestECSRefresherDescribeServices(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 
@@ -391,13 +417,11 @@ func TestECSDiscoveryDescribeServices(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			client := newMockECSClient(tt.ecsData)
 
-			d := &ECSDiscovery{
-				ecs: client,
-				cfg: &ECSSDConfig{
-					Region:             tt.ecsData.region,
-					RequestConcurrency: 2,
-				},
-			}
+			d := newTestECSRefresher(&SDConfig{
+				Role:               RoleECS,
+				Region:             tt.ecsData.region,
+				RequestConcurrency: 2,
+			}, client, nil)
 
 			services, err := d.describeServices(ctx, tt.clusterARN, tt.serviceARNs)
 			require.NoError(t, err)
@@ -406,7 +430,7 @@ func TestECSDiscoveryDescribeServices(t *testing.T) {
 	}
 }
 
-func TestECSDiscoveryDescribeContainerInstances(t *testing.T) {
+func TestECSRefresherDescribeContainerInstances(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 
@@ -496,13 +520,11 @@ func TestECSDiscoveryDescribeContainerInstances(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			client := newMockECSClient(tt.ecsData)
 
-			d := &ECSDiscovery{
-				ecs: client,
-				cfg: &ECSSDConfig{
-					Region:             tt.ecsData.region,
-					RequestConcurrency: 2,
-				},
-			}
+			d := newTestECSRefresher(&SDConfig{
+				Role:               RoleECS,
+				Region:             tt.ecsData.region,
+				RequestConcurrency: 2,
+			}, client, nil)
 
 			containerInstances, err := d.describeContainerInstances(ctx, tt.clusterARN, tt.tasks)
 			require.NoError(t, err)
@@ -511,7 +533,7 @@ func TestECSDiscoveryDescribeContainerInstances(t *testing.T) {
 	}
 }
 
-func TestECSDiscoveryDescribeEC2Instances(t *testing.T) {
+func TestECSRefresherDescribeEC2Instances(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 
@@ -610,13 +632,11 @@ func TestECSDiscoveryDescribeEC2Instances(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			ec2Client := newMockECSEC2Client(tt.ecsData.ec2Instances, nil)
 
-			d := &ECSDiscovery{
-				ec2: ec2Client,
-				cfg: &ECSSDConfig{
-					Region:             tt.ecsData.region,
-					RequestConcurrency: 2,
-				},
-			}
+			d := newTestECSRefresher(&SDConfig{
+				Role:               RoleECS,
+				Region:             tt.ecsData.region,
+				RequestConcurrency: 2,
+			}, nil, ec2Client)
 
 			instances, err := d.describeEC2Instances(ctx, tt.instanceIDs)
 			require.NoError(t, err)
@@ -625,7 +645,7 @@ func TestECSDiscoveryDescribeEC2Instances(t *testing.T) {
 	}
 }
 
-func TestECSDiscoveryDescribeNetworkInterfaces(t *testing.T) {
+func TestECSRefresherDescribeNetworkInterfaces(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 
@@ -752,13 +772,11 @@ func TestECSDiscoveryDescribeNetworkInterfaces(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			ec2Client := newMockECSEC2Client(nil, tt.ecsData.eniPublicIPs)
 
-			d := &ECSDiscovery{
-				ec2: ec2Client,
-				cfg: &ECSSDConfig{
-					Region:             tt.ecsData.region,
-					RequestConcurrency: 2,
-				},
-			}
+			d := newTestECSRefresher(&SDConfig{
+				Role:               RoleECS,
+				Region:             tt.ecsData.region,
+				RequestConcurrency: 2,
+			}, nil, ec2Client)
 
 			eniMap, err := d.describeNetworkInterfaces(ctx, tt.tasks)
 			require.NoError(t, err)
@@ -767,7 +785,7 @@ func TestECSDiscoveryDescribeNetworkInterfaces(t *testing.T) {
 	}
 }
 
-func TestECSDiscoveryListTaskARNs(t *testing.T) {
+func TestECSRefresherListTaskARNs(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 
@@ -827,13 +845,11 @@ func TestECSDiscoveryListTaskARNs(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			client := newMockECSClient(tt.ecsData)
 
-			d := &ECSDiscovery{
-				ecs: client,
-				cfg: &ECSSDConfig{
-					Region:             tt.ecsData.region,
-					RequestConcurrency: 1,
-				},
-			}
+			d := newTestECSRefresher(&SDConfig{
+				Role:               RoleECS,
+				Region:             tt.ecsData.region,
+				RequestConcurrency: 1,
+			}, client, nil)
 
 			taskMap, err := d.listTaskARNs(ctx, tt.clusterARNs)
 			require.NoError(t, err)
@@ -842,7 +858,7 @@ func TestECSDiscoveryListTaskARNs(t *testing.T) {
 	}
 }
 
-func TestECSDiscoveryDescribeTasks(t *testing.T) {
+func TestECSRefresherDescribeTasks(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 
@@ -917,13 +933,11 @@ func TestECSDiscoveryDescribeTasks(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			client := newMockECSClient(tt.ecsData)
 
-			d := &ECSDiscovery{
-				ecs: client,
-				cfg: &ECSSDConfig{
-					Region:             tt.ecsData.region,
-					RequestConcurrency: 1,
-				},
-			}
+			d := newTestECSRefresher(&SDConfig{
+				Role:               RoleECS,
+				Region:             tt.ecsData.region,
+				RequestConcurrency: 1,
+			}, client, nil)
 
 			tasks, err := d.describeTasks(ctx, tt.clusterARN, tt.taskARNs)
 			require.NoError(t, err)
@@ -932,7 +946,7 @@ func TestECSDiscoveryDescribeTasks(t *testing.T) {
 	}
 }
 
-func TestECSDiscoveryRefresh(t *testing.T) {
+func TestECSRefresherRefreshAWSTargets(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 
@@ -1567,20 +1581,15 @@ func TestECSDiscoveryRefresh(t *testing.T) {
 			ecsClient := newMockECSClient(tt.ecsData)
 			ec2Client := newMockECSEC2Client(tt.ecsData.ec2Instances, tt.ecsData.eniPublicIPs)
 
-			d := &ECSDiscovery{
-				ecs: ecsClient,
-				ec2: ec2Client,
-				cfg: &ECSSDConfig{
-					Region:             tt.ecsData.region,
-					Port:               80,
-					RequestConcurrency: 1,
-				},
-				region: tt.ecsData.region,
-				// NewECSDiscovery substitutes a no-op logger when none is
-				// supplied; construct the same thing here so the debug paths
-				// are exercised rather than panicking on a nil logger.
-				logger: promslog.NewNopLogger(),
-			}
+			// newTestECSRefresher sets logger to a no-op logger (mirroring what
+			// NewAWSDiscovery does when none is supplied) so the debug paths
+			// are exercised rather than panicking on a nil logger.
+			d := newTestECSRefresher(&SDConfig{
+				Role:               RoleECS,
+				Region:             tt.ecsData.region,
+				Port:               80,
+				RequestConcurrency: 1,
+			}, ecsClient, ec2Client)
 
 			groups, err := d.refresh(ctx)
 			require.NoError(t, err)

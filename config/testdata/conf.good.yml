@@ -256,9 +256,28 @@ scrape_configs:
     nomad_sd_configs:
       - server: 'http://localhost:4646'
 
+  - job_name: service-ecs
+    aws_sd_configs:
+      - role: ecs
+        region: us-east-1
+        access_key: access
+        secret_key: mysecret
+        profile: profile
+        clusters:
+          - my-cluster
+
+  - job_name: service-elasticache
+    aws_sd_configs:
+      - role: elasticache
+        region: us-east-1
+        access_key: access
+        secret_key: mysecret
+        profile: profile
+
   - job_name: service-ec2
-    ec2_sd_configs:
-      - region: us-east-1
+    aws_sd_configs:
+      - role: ec2
+        region: us-east-1
         access_key: access
         secret_key: mysecret
         profile: profile
@@ -272,12 +291,34 @@ scrape_configs:
               - web
               - db
 
-  - job_name: service-lightsail
-    lightsail_sd_configs:
-      - region: us-east-1
+  - job_name: service-msk
+    aws_sd_configs:
+      - role: msk
         access_key: access
         secret_key: mysecret
         profile: profile
+        clusters:
+          - my-cluster
+
+  - job_name: service-lightsail
+    aws_sd_configs:
+      - role: lightsail
+        region: us-east-1
+        access_key: access
+        secret_key: mysecret
+        profile: profile
+
+  - job_name: service-rds
+    aws_sd_configs:
+      - role: rds
+        region: us-east-1
+        access_key: access
+        secret_key: mysecret
+        profile: profile
+        filters:
+          - name: db-instance-id
+            values:
+              - my-db-instance
 
   - job_name: service-azure
     azure_sd_configs:
