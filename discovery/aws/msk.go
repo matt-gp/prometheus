@@ -15,29 +15,18 @@ package aws
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"log/slog"
 	"net"
 	"strconv"
 	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
-	awsConfig "github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/credentials"
-	"github.com/aws/aws-sdk-go-v2/credentials/stscreds"
 	"github.com/aws/aws-sdk-go-v2/service/kafka"
 	"github.com/aws/aws-sdk-go-v2/service/kafka/types"
-	"github.com/aws/aws-sdk-go-v2/service/sts"
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/common/config"
 	"github.com/prometheus/common/model"
-	"github.com/prometheus/common/promslog"
 	"golang.org/x/sync/errgroup"
 
-	"github.com/prometheus/prometheus/discovery"
-	"github.com/prometheus/prometheus/discovery/refresh"
 	"github.com/prometheus/prometheus/discovery/targetgroup"
 	"github.com/prometheus/prometheus/util/strutil"
 )
@@ -86,77 +75,14 @@ const (
 	mskLabelControllerEndpointIndex = mskLabelController + "endpoint_index"
 )
 
-// DefaultMSKSDConfig is the default MSK SD configuration.
-var DefaultMSKSDConfig = MSKSDConfig{
-	Port:               80,
-	RefreshInterval:    model.Duration(60 * time.Second),
-	RequestConcurrency: 10,
-	HTTPClientConfig:   config.DefaultHTTPClientConfig,
+// MSKDiscovery is the AWS discovery implementation for MSK (Kafka).
+// It implements the awsRefresher interface, which allows it to refresh AWS targets for MSK.
+type MSKDiscovery struct {
+	Discovery
+	msk mskClientAdapter
 }
 
-func init() {
-	discovery.RegisterConfig(&MSKSDConfig{})
-}
-
-// MSKSDConfig is the configuration for MSK based service discovery.
-type MSKSDConfig struct {
-	Region          string         `yaml:"region"`
-	Endpoint        string         `yaml:"endpoint"`
-	AccessKey       string         `yaml:"access_key,omitempty"`
-	SecretKey       config.Secret  `yaml:"secret_key,omitempty"`
-	Profile         string         `yaml:"profile,omitempty"`
-	RoleARN         string         `yaml:"role_arn,omitempty"`
-	ExternalID      string         `yaml:"external_id,omitempty"`
-	Clusters        []string       `yaml:"clusters,omitempty"`
-	Port            int            `yaml:"port"`
-	RefreshInterval model.Duration `yaml:"refresh_interval,omitempty"`
-
-	RequestConcurrency int                     `yaml:"request_concurrency,omitempty"`
-	HTTPClientConfig   config.HTTPClientConfig `yaml:",inline"`
-}
-
-// NewDiscovererMetrics implements discovery.Config.
-func (*MSKSDConfig) NewDiscovererMetrics(_ prometheus.Registerer, rmi discovery.RefreshMetricsInstantiator) discovery.DiscovererMetrics {
-	return &mskMetrics{
-		refreshMetrics: rmi,
-	}
-}
-
-// Name returns the name of the MSK Config.
-func (*MSKSDConfig) Name() string { return "msk" }
-
-// NewDiscoverer returns a Discoverer for the MSK Config.
-func (c *MSKSDConfig) NewDiscoverer(opts discovery.DiscovererOptions) (discovery.Discoverer, error) {
-	return NewMSKDiscovery(c, opts)
-}
-
-// SetDirectory joins any relative file paths with dir.
-func (c *MSKSDConfig) SetDirectory(dir string) {
-	c.HTTPClientConfig.SetDirectory(dir)
-}
-
-// UnmarshalYAML implements the yaml.Unmarshaler interface for the MSK Config.
-// Region resolution is deferred to initMskClient; see loadRegion.
-func (c *MSKSDConfig) UnmarshalYAML(unmarshal func(any) error) error {
-	*c = DefaultMSKSDConfig
-	type plain MSKSDConfig
-	err := unmarshal((*plain)(c))
-	if err != nil {
-		return err
-	}
-
-	if c.RequestConcurrency <= 0 {
-		return fmt.Errorf("msk_sd: request_concurrency must be positive, got %d", c.RequestConcurrency)
-	}
-
-	return c.HTTPClientConfig.Validate()
-}
-
-type mskClient interface {
-	DescribeClusterV2(context.Context, *kafka.DescribeClusterV2Input, ...func(*kafka.Options)) (*kafka.DescribeClusterV2Output, error)
-	ListClustersV2(context.Context, *kafka.ListClustersV2Input, ...func(*kafka.Options)) (*kafka.ListClustersV2Output, error)
-	ListNodes(context.Context, *kafka.ListNodesInput, ...func(*kafka.Options)) (*kafka.ListNodesOutput, error)
-}
+var _ awsDiscovery = (*MSKDiscovery)(nil)
 
 // mskClientAdapter captures only the MSK (Kafka) API calls AWS discovery uses
 // as method-value closures, keeping the concrete *kafka.Client out of any
@@ -188,112 +114,29 @@ func (a mskClientAdapter) ListNodes(ctx context.Context, params *kafka.ListNodes
 	return a.listNodes(ctx, params, optFns...)
 }
 
-// MSKDiscovery periodically performs MSK-SD requests. It implements
-// the Discoverer interface.
-type MSKDiscovery struct {
-	*refresh.Discovery
-	logger *slog.Logger
-	cfg    *MSKSDConfig
-	msk    mskClient
+// newMSKDiscovery creates a new MSKDiscovery instance
+func newMSKDiscovery(ctx context.Context, cfg aws.Config, d *Discovery) (*MSKDiscovery, error) {
 
-	// region is the resolved region used for the AWS client and for the
-	// Source label. Lazily populated by initMskClient.
-	region string
-}
-
-// NewMSKDiscovery returns a new MSKDiscovery which periodically refreshes its targets.
-func NewMSKDiscovery(conf *MSKSDConfig, opts discovery.DiscovererOptions) (*MSKDiscovery, error) {
-	m, ok := opts.Metrics.(*mskMetrics)
-	if !ok {
-		return nil, errors.New("invalid discovery metrics type")
-	}
-
-	if opts.Logger == nil {
-		opts.Logger = promslog.NewNopLogger()
-	}
-	d := &MSKDiscovery{
-		logger: opts.Logger,
-		cfg:    conf,
-	}
-	d.Discovery = refresh.NewDiscovery(
-		refresh.Options{
-			Logger:              opts.Logger,
-			Mech:                "msk",
-			Interval:            time.Duration(d.cfg.RefreshInterval),
-			RefreshF:            d.refresh,
-			MetricsInstantiator: m.refreshMetrics,
-		},
-	)
-	return d, nil
-}
-
-func (d *MSKDiscovery) initMskClient(ctx context.Context) error {
-	if d.msk != nil {
-		return nil
-	}
-
-	// Build the HTTP client from the provided HTTPClientConfig.
-	client, err := config.NewClientFromConfig(d.cfg.HTTPClientConfig, "msk_sd")
-	if err != nil {
-		return err
-	}
-
-	// Resolve the region lazily. See MSKSDConfig.UnmarshalYAML.
-	d.region, err = loadRegion(ctx, d.cfg.Region)
-	if err != nil {
-		return err
-	}
-
-	// Build the AWS config with the resolved region.
-	var configOptions []func(*awsConfig.LoadOptions) error
-	configOptions = append(configOptions, awsConfig.WithRegion(d.region))
-	configOptions = append(configOptions, awsConfig.WithHTTPClient(client))
-
-	// Only set static credentials if both access key and secret key are provided
-	// Otherwise, let AWS SDK use its default credential chain
-	if d.cfg.AccessKey != "" && d.cfg.SecretKey != "" {
-		credProvider := credentials.NewStaticCredentialsProvider(d.cfg.AccessKey, string(d.cfg.SecretKey), "")
-		configOptions = append(configOptions, awsConfig.WithCredentialsProvider(credProvider))
-	}
-
-	if d.cfg.Profile != "" {
-		configOptions = append(configOptions, awsConfig.WithSharedConfigProfile(d.cfg.Profile))
-	}
-
-	cfg, err := awsConfig.LoadDefaultConfig(ctx, configOptions...)
-	if err != nil {
-		d.logger.Error("Failed to create AWS config", "error", err)
-		return fmt.Errorf("could not create aws config: %w", err)
-	}
-
-	// If the role ARN is set, assume the role to get credentials and set the credentials provider in the config.
-	if d.cfg.RoleARN != "" {
-		assumeProvider := stscreds.NewAssumeRoleProvider(sts.NewFromConfig(cfg), d.cfg.RoleARN, func(o *stscreds.AssumeRoleOptions) {
-			if d.cfg.ExternalID != "" {
-				o.ExternalID = aws.String(d.cfg.ExternalID)
-			}
-		})
-		cfg.Credentials = aws.NewCredentialsCache(assumeProvider)
-	}
-
-	d.msk = newMSKClientAdapter(kafka.NewFromConfig(cfg, func(options *kafka.Options) {
+	clientAdapter := newMSKClientAdapter(kafka.NewFromConfig(cfg, func(options *kafka.Options) {
 		if d.cfg.Endpoint != "" {
 			options.BaseEndpoint = &d.cfg.Endpoint
 		}
-		options.HTTPClient = client
+		options.HTTPClient = cfg.HTTPClient
 	}))
 
 	// Test credentials by making a simple API call
 	testCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
-	_, err = d.msk.ListClustersV2(testCtx, &kafka.ListClustersV2Input{})
+	_, err := clientAdapter.ListClustersV2(testCtx, &kafka.ListClustersV2Input{})
 	if err != nil {
-		d.logger.Error("Failed to test MSK credentials", "error", err)
-		return fmt.Errorf("MSK credential test failed: %w", err)
+		return nil, fmt.Errorf("msk credential test failed: %w", err)
 	}
 
-	return nil
+	return &MSKDiscovery{
+		Discovery: *d,
+		msk:       clientAdapter,
+	}, nil
 }
 
 // describeClusters describes the clusters with the given ARNs and returns their details.
@@ -401,10 +244,8 @@ func (d *MSKDiscovery) listNodes(ctx context.Context, clusters []types.Cluster) 
 }
 
 func (d *MSKDiscovery) refresh(ctx context.Context) ([]*targetgroup.Group, error) {
-	err := d.initMskClient(ctx)
-	if err != nil {
-		return nil, err
-	}
+
+	var err error
 
 	tg := &targetgroup.Group{
 		Source: d.region,

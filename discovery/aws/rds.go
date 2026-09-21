@@ -15,9 +15,7 @@ package aws
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"log/slog"
 	"maps"
 	"net"
 	"strconv"
@@ -25,20 +23,11 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
-	awsConfig "github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/credentials"
-	"github.com/aws/aws-sdk-go-v2/credentials/stscreds"
 	"github.com/aws/aws-sdk-go-v2/service/rds"
 	"github.com/aws/aws-sdk-go-v2/service/rds/types"
-	"github.com/aws/aws-sdk-go-v2/service/sts"
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/common/config"
 	"github.com/prometheus/common/model"
-	"github.com/prometheus/common/promslog"
 	"golang.org/x/sync/errgroup"
 
-	"github.com/prometheus/prometheus/discovery"
-	"github.com/prometheus/prometheus/discovery/refresh"
 	"github.com/prometheus/prometheus/discovery/targetgroup"
 	"github.com/prometheus/prometheus/util/strutil"
 )
@@ -206,77 +195,14 @@ const (
 	rdsLabelInstanceTag = rdsLabelInstance + "tag_"
 )
 
-// DefaultRDSSDConfig is the default RDS SD configuration.
-var DefaultRDSSDConfig = RDSSDConfig{
-	Port:               80,
-	RefreshInterval:    model.Duration(60 * time.Second),
-	RequestConcurrency: 10,
-	HTTPClientConfig:   config.DefaultHTTPClientConfig,
+// RDSDiscovery is the AWS discovery implementation for RDS.
+// It implements the awsRefresher interface, which allows it to refresh AWS targets for RDS.
+type RDSDiscovery struct {
+	Discovery
+	rds rdsClientAdapter
 }
 
-func init() {
-	discovery.RegisterConfig(&RDSSDConfig{})
-}
-
-// RDSSDConfig is the configuration for RDS based service discovery.
-type RDSSDConfig struct {
-	Region          string         `yaml:"region"`
-	Endpoint        string         `yaml:"endpoint"`
-	AccessKey       string         `yaml:"access_key,omitempty"`
-	SecretKey       config.Secret  `yaml:"secret_key,omitempty"`
-	Profile         string         `yaml:"profile,omitempty"`
-	RoleARN         string         `yaml:"role_arn,omitempty"`
-	ExternalID      string         `yaml:"external_id,omitempty"`
-	Clusters        []string       `yaml:"clusters,omitempty"`
-	Port            int            `yaml:"port"`
-	RefreshInterval model.Duration `yaml:"refresh_interval,omitempty"`
-	Filters         []*Filter      `yaml:"filters"`
-
-	RequestConcurrency int                     `yaml:"request_concurrency,omitempty"`
-	HTTPClientConfig   config.HTTPClientConfig `yaml:",inline"`
-}
-
-// NewDiscovererMetrics implements discovery.Config.
-func (*RDSSDConfig) NewDiscovererMetrics(_ prometheus.Registerer, rmi discovery.RefreshMetricsInstantiator) discovery.DiscovererMetrics {
-	return &rdsMetrics{
-		refreshMetrics: rmi,
-	}
-}
-
-// Name returns the name of the RDS Config.
-func (*RDSSDConfig) Name() string { return "rds" }
-
-// NewDiscoverer returns a Discoverer for the RDS Config.
-func (c *RDSSDConfig) NewDiscoverer(opts discovery.DiscovererOptions) (discovery.Discoverer, error) {
-	return NewRDSDiscovery(c, opts)
-}
-
-// SetDirectory joins any relative file paths with dir.
-func (c *RDSSDConfig) SetDirectory(dir string) {
-	c.HTTPClientConfig.SetDirectory(dir)
-}
-
-// UnmarshalYAML implements the yaml.Unmarshaler interface for the RDS Config.
-// Region resolution is deferred to initRdsClient; see loadRegion.
-func (c *RDSSDConfig) UnmarshalYAML(unmarshal func(any) error) error {
-	*c = DefaultRDSSDConfig
-	type plain RDSSDConfig
-	err := unmarshal((*plain)(c))
-	if err != nil {
-		return err
-	}
-
-	if c.RequestConcurrency <= 0 {
-		return fmt.Errorf("rds_sd: request_concurrency must be positive, got %d", c.RequestConcurrency)
-	}
-
-	return c.HTTPClientConfig.Validate()
-}
-
-type rdsClient interface {
-	DescribeDBClusters(context.Context, *rds.DescribeDBClustersInput, ...func(*rds.Options)) (*rds.DescribeDBClustersOutput, error)
-	DescribeDBInstances(context.Context, *rds.DescribeDBInstancesInput, ...func(*rds.Options)) (*rds.DescribeDBInstancesOutput, error)
-}
+var _ awsDiscovery = (*RDSDiscovery)(nil)
 
 // rdsClientAdapter captures only the RDS API calls AWS discovery uses as
 // method-value closures, keeping the concrete *rds.Client out of any
@@ -302,112 +228,29 @@ func (a rdsClientAdapter) DescribeDBInstances(ctx context.Context, params *rds.D
 	return a.describeDBInstances(ctx, params, optFns...)
 }
 
-// RDSDiscovery periodically performs RDS-SD requests. It implements
-// the Discoverer interface.
-type RDSDiscovery struct {
-	*refresh.Discovery
-	logger *slog.Logger
-	cfg    *RDSSDConfig
-	rds    rdsClient
+// newRDSDiscovery creates a new RDSDiscovery instance
+func newRDSDiscovery(ctx context.Context, cfg aws.Config, d *Discovery) (*RDSDiscovery, error) {
 
-	// region is the resolved region used for the AWS client and for the
-	// Source label. Lazily populated by initRdsClient.
-	region string
-}
-
-// NewRDSDiscovery returns a new RDSDiscovery which periodically refreshes its targets.
-func NewRDSDiscovery(conf *RDSSDConfig, opts discovery.DiscovererOptions) (*RDSDiscovery, error) {
-	m, ok := opts.Metrics.(*rdsMetrics)
-	if !ok {
-		return nil, errors.New("invalid discovery metrics type")
-	}
-
-	if opts.Logger == nil {
-		opts.Logger = promslog.NewNopLogger()
-	}
-	d := &RDSDiscovery{
-		logger: opts.Logger,
-		cfg:    conf,
-	}
-	d.Discovery = refresh.NewDiscovery(
-		refresh.Options{
-			Logger:              opts.Logger,
-			Mech:                "rds",
-			Interval:            time.Duration(d.cfg.RefreshInterval),
-			RefreshF:            d.refresh,
-			MetricsInstantiator: m.refreshMetrics,
-		},
-	)
-	return d, nil
-}
-
-func (d *RDSDiscovery) initRdsClient(ctx context.Context) error {
-	if d.rds != nil {
-		return nil
-	}
-
-	// Build the HTTP client from the provided HTTPClientConfig.
-	client, err := config.NewClientFromConfig(d.cfg.HTTPClientConfig, "rds_sd")
-	if err != nil {
-		return err
-	}
-
-	// Resolve the region lazily. See RDSSDConfig.UnmarshalYAML.
-	d.region, err = loadRegion(ctx, d.cfg.Region)
-	if err != nil {
-		return err
-	}
-
-	// Build the AWS config with the resolved region.
-	var configOptions []func(*awsConfig.LoadOptions) error
-	configOptions = append(configOptions, awsConfig.WithRegion(d.region))
-	configOptions = append(configOptions, awsConfig.WithHTTPClient(client))
-
-	// Only set static credentials if both access key and secret key are provided
-	// Otherwise, let AWS SDK use its default credential chain
-	if d.cfg.AccessKey != "" && d.cfg.SecretKey != "" {
-		credProvider := credentials.NewStaticCredentialsProvider(d.cfg.AccessKey, string(d.cfg.SecretKey), "")
-		configOptions = append(configOptions, awsConfig.WithCredentialsProvider(credProvider))
-	}
-
-	if d.cfg.Profile != "" {
-		configOptions = append(configOptions, awsConfig.WithSharedConfigProfile(d.cfg.Profile))
-	}
-
-	cfg, err := awsConfig.LoadDefaultConfig(ctx, configOptions...)
-	if err != nil {
-		d.logger.Error("Failed to create AWS config", "error", err)
-		return fmt.Errorf("could not create aws config: %w", err)
-	}
-
-	// If the role ARN is set, assume the role to get credentials and set the credentials provider in the config.
-	if d.cfg.RoleARN != "" {
-		assumeProvider := stscreds.NewAssumeRoleProvider(sts.NewFromConfig(cfg), d.cfg.RoleARN, func(o *stscreds.AssumeRoleOptions) {
-			if d.cfg.ExternalID != "" {
-				o.ExternalID = aws.String(d.cfg.ExternalID)
-			}
-		})
-		cfg.Credentials = aws.NewCredentialsCache(assumeProvider)
-	}
-
-	d.rds = newRDSClientAdapter(rds.NewFromConfig(cfg, func(options *rds.Options) {
+	clientAdapter := newRDSClientAdapter(rds.NewFromConfig(cfg, func(options *rds.Options) {
 		if d.cfg.Endpoint != "" {
 			options.BaseEndpoint = &d.cfg.Endpoint
 		}
-		options.HTTPClient = client
+		options.HTTPClient = cfg.HTTPClient
 	}))
 
 	// Test credentials by making a simple API call
 	testCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
-	_, err = d.rds.DescribeDBClusters(testCtx, &rds.DescribeDBClustersInput{})
+	_, err := clientAdapter.DescribeDBClusters(testCtx, &rds.DescribeDBClustersInput{})
 	if err != nil {
-		d.logger.Error("Failed to test RDS credentials", "error", err)
-		return fmt.Errorf("RDS credential test failed: %w", err)
+		return nil, fmt.Errorf("failed to test RDS credentials: %w", err)
 	}
 
-	return nil
+	return &RDSDiscovery{
+		Discovery: *d,
+		rds:       clientAdapter,
+	}, nil
 }
 
 func (d *RDSDiscovery) describeAllDBClusters(ctx context.Context) (map[string]types.DBCluster, error) {
@@ -513,10 +356,8 @@ func (d *RDSDiscovery) describeDBInstances(ctx context.Context, dbClusterARN str
 }
 
 func (d *RDSDiscovery) refresh(ctx context.Context) ([]*targetgroup.Group, error) {
-	err := d.initRdsClient(ctx)
-	if err != nil {
-		return nil, err
-	}
+
+	var err error
 
 	tg := &targetgroup.Group{
 		Source: d.region,

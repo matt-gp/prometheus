@@ -117,9 +117,16 @@ func TestMSKDiscoveryListClusters(t *testing.T) {
 			client := newMockMSKClient(tt.mskData)
 
 			d := &MSKDiscovery{
-				msk: client,
-				cfg: &MSKSDConfig{
-					Region: tt.mskData.region,
+				Discovery: Discovery{
+					cfg: &SDConfig{
+						Role:   RoleMSK,
+						Region: tt.mskData.region,
+					},
+				},
+				msk: mskClientAdapter{
+					describeClusterV2: client.DescribeClusterV2,
+					listClustersV2:    client.ListClustersV2,
+					listNodes:         client.ListNodes,
 				},
 			}
 
@@ -257,11 +264,18 @@ func TestMSKDiscoveryDescribeClusters(t *testing.T) {
 			client := newMockMSKClient(tt.mskData)
 
 			d := &MSKDiscovery{
-				msk:    client,
-				logger: promslog.NewNopLogger(),
-				cfg: &MSKSDConfig{
-					Region:             tt.mskData.region,
-					RequestConcurrency: 10,
+				Discovery: Discovery{
+					logger: promslog.NewNopLogger(),
+					cfg: &SDConfig{
+						Role:               RoleMSK,
+						Region:             tt.mskData.region,
+						RequestConcurrency: 10,
+					},
+				},
+				msk: mskClientAdapter{
+					describeClusterV2: client.DescribeClusterV2,
+					listClustersV2:    client.ListClustersV2,
+					listNodes:         client.ListNodes,
 				},
 			}
 
@@ -434,10 +448,17 @@ func TestMSKDiscoveryListNodes(t *testing.T) {
 			client := newMockMSKClient(tt.mskData)
 
 			d := &MSKDiscovery{
-				msk: client,
-				cfg: &MSKSDConfig{
-					Region:             tt.mskData.region,
-					RequestConcurrency: 10,
+				Discovery: Discovery{
+					cfg: &SDConfig{
+						Role:               RoleMSK,
+						Region:             tt.mskData.region,
+						RequestConcurrency: 10,
+					},
+				},
+				msk: mskClientAdapter{
+					describeClusterV2: client.DescribeClusterV2,
+					listClustersV2:    client.ListClustersV2,
+					listNodes:         client.ListNodes,
 				},
 			}
 
@@ -455,7 +476,7 @@ func TestMSKDiscoveryRefresh(t *testing.T) {
 	tests := []struct {
 		name     string
 		mskData  *mskDataStore
-		config   *MSKSDConfig
+		config   *SDConfig
 		expected []*targetgroup.Group
 	}{
 		{
@@ -509,7 +530,8 @@ func TestMSKDiscoveryRefresh(t *testing.T) {
 					},
 				},
 			},
-			config: &MSKSDConfig{
+			config: &SDConfig{
+				Role:               RoleMSK,
 				Region:             "us-west-2",
 				Port:               80,
 				RequestConcurrency: 10,
@@ -578,7 +600,8 @@ func TestMSKDiscoveryRefresh(t *testing.T) {
 					},
 				},
 			},
-			config: &MSKSDConfig{
+			config: &SDConfig{
+				Role:               RoleMSK,
 				Region:             "us-west-2",
 				Port:               80,
 				RequestConcurrency: 10,
@@ -630,7 +653,8 @@ func TestMSKDiscoveryRefresh(t *testing.T) {
 					},
 				},
 			},
-			config: &MSKSDConfig{
+			config: &SDConfig{
+				Role:               RoleMSK,
 				Region:             "us-west-2",
 				Port:               80,
 				RequestConcurrency: 10,
@@ -709,7 +733,8 @@ func TestMSKDiscoveryRefresh(t *testing.T) {
 					},
 				},
 			},
-			config: &MSKSDConfig{
+			config: &SDConfig{
+				Role:               RoleMSK,
 				Region:             "us-west-2",
 				Port:               80,
 				RequestConcurrency: 10,
@@ -749,7 +774,8 @@ func TestMSKDiscoveryRefresh(t *testing.T) {
 				region:   "us-east-1",
 				clusters: []types.Cluster{},
 			},
-			config: &MSKSDConfig{
+			config: &SDConfig{
+				Role:               RoleMSK,
 				Region:             "us-east-1",
 				Port:               80,
 				RequestConcurrency: 10,
@@ -808,7 +834,8 @@ func TestMSKDiscoveryRefresh(t *testing.T) {
 					},
 				},
 			},
-			config: &MSKSDConfig{
+			config: &SDConfig{
+				Role:               RoleMSK,
 				Region:             "us-west-2",
 				Port:               80,
 				RequestConcurrency: 10,
@@ -922,7 +949,8 @@ func TestMSKDiscoveryRefresh(t *testing.T) {
 					},
 				},
 			},
-			config: &MSKSDConfig{
+			config: &SDConfig{
+				Role:               RoleMSK,
 				Region:             "us-west-2",
 				Port:               80,
 				RequestConcurrency: 10,
@@ -1075,7 +1103,8 @@ func TestMSKDiscoveryRefresh(t *testing.T) {
 					},
 				},
 			},
-			config: &MSKSDConfig{
+			config: &SDConfig{
+				Role:               RoleMSK,
 				Region:             "us-east-1",
 				Port:               80,
 				RequestConcurrency: 10,
@@ -1234,7 +1263,8 @@ func TestMSKDiscoveryRefresh(t *testing.T) {
 			config := tt.config
 			if config == nil {
 				// Default config for backward compatibility
-				config = &MSKSDConfig{
+				config = &SDConfig{
+					Role:               RoleMSK,
 					Region:             tt.mskData.region,
 					Port:               80,
 					RequestConcurrency: 10,
@@ -1242,13 +1272,19 @@ func TestMSKDiscoveryRefresh(t *testing.T) {
 			}
 
 			d := &MSKDiscovery{
-				msk:    client,
-				logger: promslog.NewNopLogger(),
-				cfg:    config,
-				region: tt.mskData.region,
+				Discovery: Discovery{
+					logger: promslog.NewNopLogger(),
+					cfg:    config,
+					region: tt.mskData.region,
+				},
+				msk: mskClientAdapter{
+					describeClusterV2: client.DescribeClusterV2,
+					listClustersV2:    client.ListClustersV2,
+					listNodes:         client.ListNodes,
+				},
 			}
 
-			groups, err := d.refresh(ctx)
+			groups, err := d.refresh(context.Background())
 			require.NoError(t, err)
 
 			// Sort targets within each group by address to handle non-deterministic ordering from goroutines
@@ -1318,16 +1354,25 @@ func mskTestDiscovery(data *mskDataStore) *MSKDiscovery {
 		clusterARNs = append(clusterARNs, aws.ToString(cluster.ClusterArn))
 	}
 
+	client := newMockMSKClient(data)
+
 	return &MSKDiscovery{
-		logger: promslog.NewNopLogger(),
-		msk:    newMockMSKClient(data),
-		cfg: &MSKSDConfig{
-			Port:               4242,
-			Region:             data.region,
-			RequestConcurrency: 10,
-			Clusters:           clusterARNs,
+		Discovery: Discovery{
+			logger: promslog.NewNopLogger(),
+			cfg: &SDConfig{
+				Role:               RoleMSK,
+				Port:               4242,
+				Region:             data.region,
+				RequestConcurrency: 10,
+				Clusters:           clusterARNs,
+			},
+			region: data.region,
 		},
-		region: data.region,
+		msk: mskClientAdapter{
+			describeClusterV2: client.DescribeClusterV2,
+			listClustersV2:    client.ListClustersV2,
+			listNodes:         client.ListNodes,
+		},
 	}
 }
 

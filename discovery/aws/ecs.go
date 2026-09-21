@@ -15,9 +15,7 @@ package aws
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"log/slog"
 	"net"
 	"slices"
 	"strconv"
@@ -26,21 +24,12 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
-	awsConfig "github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/credentials"
-	"github.com/aws/aws-sdk-go-v2/credentials/stscreds"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	"github.com/aws/aws-sdk-go-v2/service/ecs"
 	"github.com/aws/aws-sdk-go-v2/service/ecs/types"
-	"github.com/aws/aws-sdk-go-v2/service/sts"
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/common/config"
 	"github.com/prometheus/common/model"
-	"github.com/prometheus/common/promslog"
 	"golang.org/x/sync/errgroup"
 
-	"github.com/prometheus/prometheus/discovery"
-	"github.com/prometheus/prometheus/discovery/refresh"
 	"github.com/prometheus/prometheus/discovery/targetgroup"
 	"github.com/prometheus/prometheus/util/strutil"
 )
@@ -79,88 +68,15 @@ const (
 	ecsLabelPublicIP             = ecsLabel + "public_ip"
 )
 
-// DefaultECSSDConfig is the default ECS SD configuration.
-var DefaultECSSDConfig = ECSSDConfig{
-	Port:               80,
-	RefreshInterval:    model.Duration(60 * time.Second),
-	RequestConcurrency: 20, // Aligned with AWS ECS API sustained rate limits (20 req/sec)
-	HTTPClientConfig:   config.DefaultHTTPClientConfig,
+// ECSDiscovery is the AWS discovery implementation for ECS.
+// It implements the awsRefresher interface, which allows it to refresh AWS targets for ECS.
+type ECSDiscovery struct {
+	Discovery
+	ecs ecsClientAdapter
+	ec2 ec2ClientAdapter
 }
 
-func init() {
-	discovery.RegisterConfig(&ECSSDConfig{})
-}
-
-// ECSSDConfig is the configuration for ECS based service discovery.
-type ECSSDConfig struct {
-	Region          string         `yaml:"region"`
-	Endpoint        string         `yaml:"endpoint"`
-	AccessKey       string         `yaml:"access_key,omitempty"`
-	SecretKey       config.Secret  `yaml:"secret_key,omitempty"`
-	Profile         string         `yaml:"profile,omitempty"`
-	RoleARN         string         `yaml:"role_arn,omitempty"`
-	ExternalID      string         `yaml:"external_id,omitempty"`
-	Clusters        []string       `yaml:"clusters,omitempty"`
-	Port            int            `yaml:"port"`
-	RefreshInterval model.Duration `yaml:"refresh_interval,omitempty"`
-
-	// RequestConcurrency controls the maximum number of concurrent ECS API requests.
-	// Default is 20, which aligns with AWS ECS sustained rate limits:
-	// - Cluster read actions (DescribeClusters, ListClusters): 20 req/sec sustained
-	// - Service read actions (DescribeServices, ListServices): 20 req/sec sustained
-	// - Cluster resource read actions (DescribeTasks, ListTasks): 20 req/sec sustained
-	// See: https://docs.aws.amazon.com/AmazonECS/latest/APIReference/request-throttling.html
-	RequestConcurrency int `yaml:"request_concurrency,omitempty"`
-
-	HTTPClientConfig config.HTTPClientConfig `yaml:",inline"`
-}
-
-// NewDiscovererMetrics implements discovery.Config.
-func (*ECSSDConfig) NewDiscovererMetrics(_ prometheus.Registerer, rmi discovery.RefreshMetricsInstantiator) discovery.DiscovererMetrics {
-	return &ecsMetrics{
-		refreshMetrics: rmi,
-	}
-}
-
-// Name returns the name of the ECS Config.
-func (*ECSSDConfig) Name() string { return "ecs" }
-
-// NewDiscoverer returns a Discoverer for the EC2 Config.
-func (c *ECSSDConfig) NewDiscoverer(opts discovery.DiscovererOptions) (discovery.Discoverer, error) {
-	return NewECSDiscovery(c, opts)
-}
-
-// SetDirectory joins any relative file paths with dir.
-func (c *ECSSDConfig) SetDirectory(dir string) {
-	c.HTTPClientConfig.SetDirectory(dir)
-}
-
-// UnmarshalYAML implements the yaml.Unmarshaler interface for the ECS Config.
-// Region resolution is deferred to initEcsClient; see loadRegion.
-func (c *ECSSDConfig) UnmarshalYAML(unmarshal func(any) error) error {
-	*c = DefaultECSSDConfig
-	type plain ECSSDConfig
-	err := unmarshal((*plain)(c))
-	if err != nil {
-		return err
-	}
-
-	if c.RequestConcurrency <= 0 {
-		return fmt.Errorf("ecs_sd: request_concurrency must be positive, got %d", c.RequestConcurrency)
-	}
-
-	return c.HTTPClientConfig.Validate()
-}
-
-type ecsClient interface {
-	ListClusters(context.Context, *ecs.ListClustersInput, ...func(*ecs.Options)) (*ecs.ListClustersOutput, error)
-	DescribeClusters(context.Context, *ecs.DescribeClustersInput, ...func(*ecs.Options)) (*ecs.DescribeClustersOutput, error)
-	ListServices(context.Context, *ecs.ListServicesInput, ...func(*ecs.Options)) (*ecs.ListServicesOutput, error)
-	DescribeServices(context.Context, *ecs.DescribeServicesInput, ...func(*ecs.Options)) (*ecs.DescribeServicesOutput, error)
-	ListTasks(context.Context, *ecs.ListTasksInput, ...func(*ecs.Options)) (*ecs.ListTasksOutput, error)
-	DescribeTasks(context.Context, *ecs.DescribeTasksInput, ...func(*ecs.Options)) (*ecs.DescribeTasksOutput, error)
-	DescribeContainerInstances(context.Context, *ecs.DescribeContainerInstancesInput, ...func(*ecs.Options)) (*ecs.DescribeContainerInstancesOutput, error)
-}
+var _ awsDiscovery = (*ECSDiscovery)(nil)
 
 // ecsClientAdapter captures only the ECS API calls AWS discovery uses as
 // method-value closures, keeping the concrete *ecs.Client out of any
@@ -221,117 +137,35 @@ type ecsEC2Client interface {
 	DescribeNetworkInterfaces(context.Context, *ec2.DescribeNetworkInterfacesInput, ...func(*ec2.Options)) (*ec2.DescribeNetworkInterfacesOutput, error)
 }
 
-// ECSDiscovery periodically performs ECS-SD requests. It implements
-// the Discoverer interface.
-type ECSDiscovery struct {
-	*refresh.Discovery
-	logger *slog.Logger
-	cfg    *ECSSDConfig
-	ecs    ecsClient
-	ec2    ecsEC2Client
+// newECSDiscovery creates a new ECSDiscovery instance
+func newECSDiscovery(ctx context.Context, cfg aws.Config, d *Discovery) (*ECSDiscovery, error) {
 
-	// region is the resolved region used for the AWS client and for the
-	// Source / __meta_ecs_region labels. Lazily populated by initEcsClient.
-	region string
-}
-
-// NewECSDiscovery returns a new ECSDiscovery which periodically refreshes its targets.
-func NewECSDiscovery(conf *ECSSDConfig, opts discovery.DiscovererOptions) (*ECSDiscovery, error) {
-	m, ok := opts.Metrics.(*ecsMetrics)
-	if !ok {
-		return nil, errors.New("invalid discovery metrics type")
-	}
-
-	if opts.Logger == nil {
-		opts.Logger = promslog.NewNopLogger()
-	}
-	d := &ECSDiscovery{
-		logger: opts.Logger,
-		cfg:    conf,
-	}
-	d.Discovery = refresh.NewDiscovery(
-		refresh.Options{
-			Logger:              opts.Logger,
-			Mech:                "ecs",
-			Interval:            time.Duration(d.cfg.RefreshInterval),
-			RefreshF:            d.refresh,
-			MetricsInstantiator: m.refreshMetrics,
-		},
-	)
-	return d, nil
-}
-
-func (d *ECSDiscovery) initEcsClient(ctx context.Context) error {
-	if d.ecs != nil && d.ec2 != nil {
-		return nil
-	}
-
-	// Build the HTTP client from the provided HTTPClientConfig.
-	client, err := config.NewClientFromConfig(d.cfg.HTTPClientConfig, "ecs_sd")
-	if err != nil {
-		return err
-	}
-
-	// Resolve the region lazily. See ECSSDConfig.UnmarshalYAML.
-	d.region, err = loadRegion(ctx, d.cfg.Region)
-	if err != nil {
-		return err
-	}
-
-	// Build the AWS config with the resolved region.
-	var configOptions []func(*awsConfig.LoadOptions) error
-	configOptions = append(configOptions, awsConfig.WithRegion(d.region))
-	configOptions = append(configOptions, awsConfig.WithHTTPClient(client))
-
-	// Only set static credentials if both access key and secret key are provided
-	// Otherwise, let AWS SDK use its default credential chain
-	if d.cfg.AccessKey != "" && d.cfg.SecretKey != "" {
-		credProvider := credentials.NewStaticCredentialsProvider(d.cfg.AccessKey, string(d.cfg.SecretKey), "")
-		configOptions = append(configOptions, awsConfig.WithCredentialsProvider(credProvider))
-	}
-
-	if d.cfg.Profile != "" {
-		configOptions = append(configOptions, awsConfig.WithSharedConfigProfile(d.cfg.Profile))
-	}
-
-	cfg, err := awsConfig.LoadDefaultConfig(ctx, configOptions...)
-	if err != nil {
-		d.logger.Error("Failed to create AWS config", "error", err)
-		return fmt.Errorf("could not create aws config: %w", err)
-	}
-
-	// If the role ARN is set, assume the role to get credentials and set the credentials provider in the config.
-	if d.cfg.RoleARN != "" {
-		assumeProvider := stscreds.NewAssumeRoleProvider(sts.NewFromConfig(cfg), d.cfg.RoleARN, func(o *stscreds.AssumeRoleOptions) {
-			if d.cfg.ExternalID != "" {
-				o.ExternalID = aws.String(d.cfg.ExternalID)
-			}
-		})
-		cfg.Credentials = aws.NewCredentialsCache(assumeProvider)
-	}
-
-	d.ecs = newECSClientAdapter(ecs.NewFromConfig(cfg, func(options *ecs.Options) {
+	ecsClientAdapter := newECSClientAdapter(ecs.NewFromConfig(cfg, func(options *ecs.Options) {
 		if d.cfg.Endpoint != "" {
 			options.BaseEndpoint = &d.cfg.Endpoint
 		}
-		options.HTTPClient = client
+		options.HTTPClient = cfg.HTTPClient
 	}))
 
-	d.ec2 = newEC2ClientAdapter(ec2.NewFromConfig(cfg, func(options *ec2.Options) {
-		options.HTTPClient = client
+	ec2ClientAdapter := newEC2ClientAdapter(ec2.NewFromConfig(cfg, func(options *ec2.Options) {
+		options.HTTPClient = cfg.HTTPClient
 	}))
 
 	// Test credentials by making a simple API call
 	testCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
-	_, err = d.ecs.DescribeClusters(testCtx, &ecs.DescribeClustersInput{})
+	_, err := ecsClientAdapter.DescribeClusters(testCtx, &ecs.DescribeClustersInput{})
 	if err != nil {
 		d.logger.Error("Failed to test ECS credentials", "error", err)
-		return fmt.Errorf("ECS credential test failed: %w", err)
+		return nil, fmt.Errorf("ECS credential test failed: %w", err)
 	}
 
-	return nil
+	return &ECSDiscovery{
+		Discovery: *d,
+		ecs:       ecsClientAdapter,
+		ec2:       ec2ClientAdapter,
+	}, nil
 }
 
 // listClusterARNs returns a slice of cluster arns.
@@ -702,12 +536,11 @@ func (d *ECSDiscovery) describeNetworkInterfaces(ctx context.Context, tasks []ty
 }
 
 func (d *ECSDiscovery) refresh(ctx context.Context) ([]*targetgroup.Group, error) {
-	err := d.initEcsClient(ctx)
-	if err != nil {
-		return nil, err
-	}
 
-	var clusters []string
+	var (
+		clusters []string
+		err      error
+	)
 	if len(d.cfg.Clusters) == 0 {
 		clusters, err = d.listClusterARNs(ctx)
 		if err != nil {

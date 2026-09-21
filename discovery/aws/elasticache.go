@@ -15,7 +15,6 @@ package aws
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
 	"maps"
@@ -26,20 +25,11 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
-	awsConfig "github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/credentials"
-	"github.com/aws/aws-sdk-go-v2/credentials/stscreds"
 	"github.com/aws/aws-sdk-go-v2/service/elasticache"
 	"github.com/aws/aws-sdk-go-v2/service/elasticache/types"
-	"github.com/aws/aws-sdk-go-v2/service/sts"
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/common/config"
 	"github.com/prometheus/common/model"
-	"github.com/prometheus/common/promslog"
 	"golang.org/x/sync/errgroup"
 
-	"github.com/prometheus/prometheus/discovery"
-	"github.com/prometheus/prometheus/discovery/refresh"
 	"github.com/prometheus/prometheus/discovery/targetgroup"
 	"github.com/prometheus/prometheus/util/strutil"
 )
@@ -172,79 +162,14 @@ const (
 	elasticacheLabelServerlessCacheTag = elasticacheLabelServerlessCache + "tag_"
 )
 
-// DefaultElasticacheSDConfig is the default Elasticache SD configuration.
-var DefaultElasticacheSDConfig = ElasticacheSDConfig{
-	Port:               80,
-	RefreshInterval:    model.Duration(60 * time.Second),
-	RequestConcurrency: 10,
-	HTTPClientConfig:   config.DefaultHTTPClientConfig,
+// ElasticacheDiscovery is the AWS discovery implementation for ElastiCache.
+// It implements the awsDiscovery interface, which allows it to refresh AWS targets for ElastiCache.
+type ElasticacheDiscovery struct {
+	Discovery
+	elasticacheClient elasticacheClientAdapter
 }
 
-func init() {
-	discovery.RegisterConfig(&ElasticacheSDConfig{})
-}
-
-// ElasticacheSDConfig is the configuration for Elasticache based service discovery.
-type ElasticacheSDConfig struct {
-	Region          string         `yaml:"region"`
-	Endpoint        string         `yaml:"endpoint"`
-	AccessKey       string         `yaml:"access_key,omitempty"`
-	SecretKey       config.Secret  `yaml:"secret_key,omitempty"`
-	Profile         string         `yaml:"profile,omitempty"`
-	RoleARN         string         `yaml:"role_arn,omitempty"`
-	ExternalID      string         `yaml:"external_id,omitempty"`
-	Clusters        []string       `yaml:"clusters,omitempty"`
-	Port            int            `yaml:"port"`
-	RefreshInterval model.Duration `yaml:"refresh_interval,omitempty"`
-
-	// RequestConcurrency controls the maximum number of concurrent Elasticache API requests.
-	RequestConcurrency int `yaml:"request_concurrency,omitempty"`
-
-	HTTPClientConfig config.HTTPClientConfig `yaml:",inline"`
-}
-
-// NewDiscovererMetrics implements discovery.Config.
-func (*ElasticacheSDConfig) NewDiscovererMetrics(_ prometheus.Registerer, rmi discovery.RefreshMetricsInstantiator) discovery.DiscovererMetrics {
-	return &elasticacheMetrics{
-		refreshMetrics: rmi,
-	}
-}
-
-// Name returns the name of the Elasticache Config.
-func (*ElasticacheSDConfig) Name() string { return "elasticache" }
-
-// NewDiscoverer returns a Discoverer for the Elasticache Config.
-func (c *ElasticacheSDConfig) NewDiscoverer(opts discovery.DiscovererOptions) (discovery.Discoverer, error) {
-	return NewElasticacheDiscovery(c, opts)
-}
-
-// SetDirectory joins any relative file paths with dir.
-func (c *ElasticacheSDConfig) SetDirectory(dir string) {
-	c.HTTPClientConfig.SetDirectory(dir)
-}
-
-// UnmarshalYAML implements the yaml.Unmarshaler interface for the Elasticache Config.
-// Region resolution is deferred to initElasticacheClient; see loadRegion.
-func (c *ElasticacheSDConfig) UnmarshalYAML(unmarshal func(any) error) error {
-	*c = DefaultElasticacheSDConfig
-	type plain ElasticacheSDConfig
-	err := unmarshal((*plain)(c))
-	if err != nil {
-		return err
-	}
-
-	if c.RequestConcurrency <= 0 {
-		return fmt.Errorf("elasticache_sd: request_concurrency must be positive, got %d", c.RequestConcurrency)
-	}
-
-	return c.HTTPClientConfig.Validate()
-}
-
-type elasticacheClient interface {
-	DescribeServerlessCaches(ctx context.Context, params *elasticache.DescribeServerlessCachesInput, optFns ...func(*elasticache.Options)) (*elasticache.DescribeServerlessCachesOutput, error)
-	DescribeCacheClusters(ctx context.Context, params *elasticache.DescribeCacheClustersInput, optFns ...func(*elasticache.Options)) (*elasticache.DescribeCacheClustersOutput, error)
-	ListTagsForResource(ctx context.Context, params *elasticache.ListTagsForResourceInput, optFns ...func(*elasticache.Options)) (*elasticache.ListTagsForResourceOutput, error)
-}
+var _ awsDiscovery = (*ElasticacheDiscovery)(nil)
 
 // elasticacheClientAdapter captures only the ElastiCache API calls AWS
 // discovery uses as method-value closures, keeping the concrete
@@ -277,112 +202,29 @@ func (a elasticacheClientAdapter) ListTagsForResource(ctx context.Context, param
 	return a.listTagsForResource(ctx, params, optFns...)
 }
 
-// ElasticacheDiscovery periodically performs Elasticache-SD requests.
-// It implements the Discoverer interface.
-type ElasticacheDiscovery struct {
-	*refresh.Discovery
-	logger            *slog.Logger
-	cfg               *ElasticacheSDConfig
-	elasticacheClient elasticacheClient
+// newElasticacheDiscovery creates a new ElasticacheDiscovery instance
+func newElasticacheDiscovery(ctx context.Context, cfg aws.Config, d *Discovery) (*ElasticacheDiscovery, error) {
 
-	// region is the resolved region used for the AWS client and for the
-	// Source label. Lazily populated by initElasticacheClient.
-	region string
-}
-
-// NewElasticacheDiscovery returns a new ElasticacheDiscovery which periodically refreshes its targets.
-func NewElasticacheDiscovery(conf *ElasticacheSDConfig, opts discovery.DiscovererOptions) (*ElasticacheDiscovery, error) {
-	m, ok := opts.Metrics.(*elasticacheMetrics)
-	if !ok {
-		return nil, errors.New("invalid discovery metrics type")
-	}
-
-	if opts.Logger == nil {
-		opts.Logger = promslog.NewNopLogger()
-	}
-	d := &ElasticacheDiscovery{
-		logger: opts.Logger,
-		cfg:    conf,
-	}
-	d.Discovery = refresh.NewDiscovery(
-		refresh.Options{
-			Logger:              opts.Logger,
-			Mech:                "elasticache",
-			Interval:            time.Duration(d.cfg.RefreshInterval),
-			RefreshF:            d.refresh,
-			MetricsInstantiator: m.refreshMetrics,
-		},
-	)
-	return d, nil
-}
-
-func (d *ElasticacheDiscovery) initElasticacheClient(ctx context.Context) error {
-	if d.elasticacheClient != nil {
-		return nil
-	}
-
-	// Build the HTTP client from the provided HTTPClientConfig.
-	client, err := config.NewClientFromConfig(d.cfg.HTTPClientConfig, "elasticache_sd")
-	if err != nil {
-		return err
-	}
-
-	// Resolve the region lazily. See ElasticacheSDConfig.UnmarshalYAML.
-	d.region, err = loadRegion(ctx, d.cfg.Region)
-	if err != nil {
-		return err
-	}
-
-	// Build the AWS config with the resolved region.
-	var configOptions []func(*awsConfig.LoadOptions) error
-	configOptions = append(configOptions, awsConfig.WithRegion(d.region))
-	configOptions = append(configOptions, awsConfig.WithHTTPClient(client))
-
-	// Only set static credentials if both access key and secret key are provided
-	// Otherwise, let AWS SDK use its default credential chain
-	if d.cfg.AccessKey != "" && d.cfg.SecretKey != "" {
-		credProvider := credentials.NewStaticCredentialsProvider(d.cfg.AccessKey, string(d.cfg.SecretKey), "")
-		configOptions = append(configOptions, awsConfig.WithCredentialsProvider(credProvider))
-	}
-
-	if d.cfg.Profile != "" {
-		configOptions = append(configOptions, awsConfig.WithSharedConfigProfile(d.cfg.Profile))
-	}
-
-	cfg, err := awsConfig.LoadDefaultConfig(ctx, configOptions...)
-	if err != nil {
-		d.logger.Error("Failed to create AWS config", "error", err)
-		return fmt.Errorf("could not create aws config: %w", err)
-	}
-
-	// If the role ARN is set, assume the role to get credentials and set the credentials provider in the config.
-	if d.cfg.RoleARN != "" {
-		assumeProvider := stscreds.NewAssumeRoleProvider(sts.NewFromConfig(cfg), d.cfg.RoleARN, func(o *stscreds.AssumeRoleOptions) {
-			if d.cfg.ExternalID != "" {
-				o.ExternalID = aws.String(d.cfg.ExternalID)
-			}
-		})
-		cfg.Credentials = aws.NewCredentialsCache(assumeProvider)
-	}
-
-	d.elasticacheClient = newElastiCacheClientAdapter(elasticache.NewFromConfig(cfg, func(options *elasticache.Options) {
+	clientAdapter := newElastiCacheClientAdapter(elasticache.NewFromConfig(cfg, func(options *elasticache.Options) {
 		if d.cfg.Endpoint != "" {
 			options.BaseEndpoint = &d.cfg.Endpoint
 		}
-		options.HTTPClient = client
+		options.HTTPClient = cfg.HTTPClient
 	}))
 
 	// Test credentials by making a simple API call
 	testCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
-	_, err = d.elasticacheClient.DescribeCacheClusters(testCtx, &elasticache.DescribeCacheClustersInput{})
+	_, err := clientAdapter.DescribeCacheClusters(testCtx, &elasticache.DescribeCacheClustersInput{})
 	if err != nil {
-		d.logger.Error("Failed to test Elasticache credentials", "error", err)
-		return fmt.Errorf("elasticache credential test failed: %w", err)
+		return nil, fmt.Errorf("elasticache credential test failed: %w", err)
 	}
 
-	return nil
+	return &ElasticacheDiscovery{
+		Discovery:         *d,
+		elasticacheClient: clientAdapter,
+	}, nil
 }
 
 // describeServerlessCaches calls DescribeServerlessCaches API for the given cache IDs (or all caches if no IDs are provided) and returns the list of serverless caches.
@@ -516,11 +358,7 @@ func (d *ElasticacheDiscovery) listTagsForResource(ctx context.Context, resource
 }
 
 func (d *ElasticacheDiscovery) refresh(ctx context.Context) ([]*targetgroup.Group, error) {
-	err := d.initElasticacheClient(ctx)
-	if err != nil {
-		return nil, err
-	}
-
+	var err error
 	serverlessCacheIDs, cacheClusterIDs := splitCacheDeploymentOptions(d.cfg.Clusters, d.logger)
 
 	// Both deployment options are described once and the results are reused to

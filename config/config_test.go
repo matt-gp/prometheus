@@ -775,6 +775,87 @@ var expectedConf = &Config{
 			},
 		},
 		{
+			JobName: "service-ecs",
+
+			HonorTimestamps:                true,
+			ScrapeInterval:                 model.Duration(15 * time.Second),
+			ScrapeTimeout:                  DefaultGlobalConfig.ScrapeTimeout,
+			EnableCompression:              true,
+			BodySizeLimit:                  globBodySizeLimit,
+			SampleLimit:                    globSampleLimit,
+			TargetLimit:                    globTargetLimit,
+			LabelLimit:                     globLabelLimit,
+			LabelNameLengthLimit:           globLabelNameLengthLimit,
+			LabelValueLengthLimit:          globLabelValueLengthLimit,
+			ScrapeProtocols:                DefaultScrapeProtocols,
+			ScrapeFailureLogFile:           globScrapeFailureLogFile,
+			MetricNameValidationScheme:     DefaultGlobalConfig.MetricNameValidationScheme,
+			MetricNameEscapingScheme:       DefaultGlobalConfig.MetricNameEscapingScheme,
+			ScrapeNativeHistograms:         boolPtr(false),
+			AlwaysScrapeClassicHistograms:  boolPtr(false),
+			ConvertClassicHistogramsToNHCB: boolPtr(false),
+			ExtraScrapeMetrics:             boolPtr(false),
+
+			MetricsPath:      DefaultScrapeConfig.MetricsPath,
+			Scheme:           DefaultScrapeConfig.Scheme,
+			HTTPClientConfig: config.DefaultHTTPClientConfig,
+
+			ServiceDiscoveryConfigs: discovery.Configs{
+				&aws.SDConfig{
+					Role:               aws.RoleECS,
+					Region:             "us-east-1",
+					AccessKey:          "access",
+					SecretKey:          "mysecret",
+					Profile:            "profile",
+					RefreshInterval:    model.Duration(60 * time.Second),
+					Port:               80,
+					RequestConcurrency: aws.DefaultSDConfig.RequestConcurrency,
+					Clusters:           []string{"my-cluster"},
+					HTTPClientConfig:   config.DefaultHTTPClientConfig,
+				},
+			},
+		},
+		{
+			JobName: "service-elasticache",
+
+			HonorTimestamps:                true,
+			ScrapeInterval:                 model.Duration(15 * time.Second),
+			ScrapeTimeout:                  DefaultGlobalConfig.ScrapeTimeout,
+			EnableCompression:              true,
+			BodySizeLimit:                  globBodySizeLimit,
+			SampleLimit:                    globSampleLimit,
+			TargetLimit:                    globTargetLimit,
+			LabelLimit:                     globLabelLimit,
+			LabelNameLengthLimit:           globLabelNameLengthLimit,
+			LabelValueLengthLimit:          globLabelValueLengthLimit,
+			ScrapeProtocols:                DefaultScrapeProtocols,
+			ScrapeFailureLogFile:           globScrapeFailureLogFile,
+			MetricNameValidationScheme:     DefaultGlobalConfig.MetricNameValidationScheme,
+			MetricNameEscapingScheme:       DefaultGlobalConfig.MetricNameEscapingScheme,
+			ScrapeNativeHistograms:         boolPtr(false),
+			AlwaysScrapeClassicHistograms:  boolPtr(false),
+			ConvertClassicHistogramsToNHCB: boolPtr(false),
+			ExtraScrapeMetrics:             boolPtr(false),
+
+			MetricsPath:      DefaultScrapeConfig.MetricsPath,
+			Scheme:           DefaultScrapeConfig.Scheme,
+			HTTPClientConfig: config.DefaultHTTPClientConfig,
+
+			ServiceDiscoveryConfigs: discovery.Configs{
+				&aws.SDConfig{
+					Role:               aws.RoleElasticache,
+					Region:             "us-east-1",
+					AccessKey:          "access",
+					SecretKey:          "mysecret",
+					Profile:            "profile",
+					RefreshInterval:    model.Duration(60 * time.Second),
+					Port:               80,
+					RequestConcurrency: aws.DefaultSDConfig.RequestConcurrency,
+					HTTPClientConfig:   config.DefaultHTTPClientConfig,
+				},
+			},
+		},
+		{
 			JobName: "service-ec2",
 
 			HonorTimestamps:                true,
@@ -801,13 +882,15 @@ var expectedConf = &Config{
 			HTTPClientConfig: config.DefaultHTTPClientConfig,
 
 			ServiceDiscoveryConfigs: discovery.Configs{
-				&aws.EC2SDConfig{
-					Region:          "us-east-1",
-					AccessKey:       "access",
-					SecretKey:       "mysecret",
-					Profile:         "profile",
-					RefreshInterval: model.Duration(60 * time.Second),
-					Port:            80,
+				&aws.SDConfig{
+					Role:               aws.RoleEC2,
+					Region:             "us-east-1",
+					AccessKey:          "access",
+					SecretKey:          "mysecret",
+					Profile:            "profile",
+					RefreshInterval:    model.Duration(60 * time.Second),
+					Port:               80,
+					RequestConcurrency: aws.DefaultSDConfig.RequestConcurrency,
 					Filters: []*aws.Filter{
 						{
 							Name:   "tag:environment",
@@ -819,6 +902,46 @@ var expectedConf = &Config{
 						},
 					},
 					HTTPClientConfig: config.DefaultHTTPClientConfig,
+				},
+			},
+		},
+		{
+			JobName: "service-msk",
+
+			HonorTimestamps:                true,
+			ScrapeInterval:                 model.Duration(15 * time.Second),
+			ScrapeTimeout:                  DefaultGlobalConfig.ScrapeTimeout,
+			EnableCompression:              true,
+			BodySizeLimit:                  globBodySizeLimit,
+			SampleLimit:                    globSampleLimit,
+			TargetLimit:                    globTargetLimit,
+			LabelLimit:                     globLabelLimit,
+			LabelNameLengthLimit:           globLabelNameLengthLimit,
+			LabelValueLengthLimit:          globLabelValueLengthLimit,
+			ScrapeProtocols:                DefaultScrapeProtocols,
+			ScrapeFailureLogFile:           globScrapeFailureLogFile,
+			MetricNameValidationScheme:     DefaultGlobalConfig.MetricNameValidationScheme,
+			MetricNameEscapingScheme:       DefaultGlobalConfig.MetricNameEscapingScheme,
+			ScrapeNativeHistograms:         boolPtr(false),
+			AlwaysScrapeClassicHistograms:  boolPtr(false),
+			ConvertClassicHistogramsToNHCB: boolPtr(false),
+			ExtraScrapeMetrics:             boolPtr(false),
+
+			MetricsPath:      DefaultScrapeConfig.MetricsPath,
+			Scheme:           DefaultScrapeConfig.Scheme,
+			HTTPClientConfig: config.DefaultHTTPClientConfig,
+
+			ServiceDiscoveryConfigs: discovery.Configs{
+				&aws.SDConfig{
+					Role:               aws.RoleMSK,
+					AccessKey:          "access",
+					SecretKey:          "mysecret",
+					Profile:            "profile",
+					RefreshInterval:    model.Duration(60 * time.Second),
+					Port:               80,
+					RequestConcurrency: aws.DefaultSDConfig.RequestConcurrency,
+					Clusters:           []string{"my-cluster"},
+					HTTPClientConfig:   config.DefaultHTTPClientConfig,
 				},
 			},
 		},
@@ -849,13 +972,61 @@ var expectedConf = &Config{
 			HTTPClientConfig: config.DefaultHTTPClientConfig,
 
 			ServiceDiscoveryConfigs: discovery.Configs{
-				&aws.LightsailSDConfig{
-					Region:           "us-east-1",
-					AccessKey:        "access",
-					SecretKey:        "mysecret",
-					Profile:          "profile",
-					RefreshInterval:  model.Duration(60 * time.Second),
-					Port:             80,
+				&aws.SDConfig{
+					Role:               aws.RoleLightsail,
+					Region:             "us-east-1",
+					AccessKey:          "access",
+					SecretKey:          "mysecret",
+					Profile:            "profile",
+					RefreshInterval:    model.Duration(60 * time.Second),
+					Port:               80,
+					RequestConcurrency: aws.DefaultSDConfig.RequestConcurrency,
+					HTTPClientConfig:   config.DefaultHTTPClientConfig,
+				},
+			},
+		},
+		{
+			JobName: "service-rds",
+
+			HonorTimestamps:                true,
+			ScrapeInterval:                 model.Duration(15 * time.Second),
+			ScrapeTimeout:                  DefaultGlobalConfig.ScrapeTimeout,
+			EnableCompression:              true,
+			BodySizeLimit:                  globBodySizeLimit,
+			SampleLimit:                    globSampleLimit,
+			TargetLimit:                    globTargetLimit,
+			LabelLimit:                     globLabelLimit,
+			LabelNameLengthLimit:           globLabelNameLengthLimit,
+			LabelValueLengthLimit:          globLabelValueLengthLimit,
+			ScrapeProtocols:                DefaultScrapeProtocols,
+			ScrapeFailureLogFile:           globScrapeFailureLogFile,
+			MetricNameValidationScheme:     DefaultGlobalConfig.MetricNameValidationScheme,
+			MetricNameEscapingScheme:       DefaultGlobalConfig.MetricNameEscapingScheme,
+			ScrapeNativeHistograms:         boolPtr(false),
+			AlwaysScrapeClassicHistograms:  boolPtr(false),
+			ConvertClassicHistogramsToNHCB: boolPtr(false),
+			ExtraScrapeMetrics:             boolPtr(false),
+
+			MetricsPath:      DefaultScrapeConfig.MetricsPath,
+			Scheme:           DefaultScrapeConfig.Scheme,
+			HTTPClientConfig: config.DefaultHTTPClientConfig,
+
+			ServiceDiscoveryConfigs: discovery.Configs{
+				&aws.SDConfig{
+					Role:               aws.RoleRDS,
+					Region:             "us-east-1",
+					AccessKey:          "access",
+					SecretKey:          "mysecret",
+					Profile:            "profile",
+					RefreshInterval:    model.Duration(60 * time.Second),
+					Port:               80,
+					RequestConcurrency: aws.DefaultSDConfig.RequestConcurrency,
+					Filters: []*aws.Filter{
+						{
+							Name:   "db-instance-id",
+							Values: []string{"my-db-instance"},
+						},
+					},
 					HTTPClientConfig: config.DefaultHTTPClientConfig,
 				},
 			},
@@ -2222,7 +2393,7 @@ func TestElideSecrets(t *testing.T) {
 	yamlConfig := string(config)
 
 	matches := secretRe.FindAllStringIndex(yamlConfig, -1)
-	require.Len(t, matches, 29, "wrong number of secret matches found")
+	require.Len(t, matches, 33, "wrong number of secret matches found")
 	require.NotContains(t, yamlConfig, "mysecret",
 		"yaml marshal reveals authentication credentials.")
 }
@@ -2550,15 +2721,21 @@ var expectedErrors = []struct {
 		errMsg:   `found multiple remote read configs with job name "queue1"`,
 	},
 	{
-		filename: "ec2_filters_empty_values.bad.yml",
-		errMsg:   `EC2 SD configuration filter values cannot be empty`,
+		// aws.SDConfig.UnmarshalYAML rejects an empty filter values list for
+		// any role that supports filters; ec2 and rds are the two that do.
+		filename: "aws_filters_empty_values_ec2.bad.yml",
+		errMsg:   `Filter values cannot be empty`,
 	},
 	{
-		filename: "ec2_token_file.bad.yml",
-		errMsg:   `at most one of bearer_token & bearer_token_file must be configured`,
+		filename: "aws_filters_empty_values_rds.bad.yml",
+		errMsg:   `Filter values cannot be empty`,
 	},
 	{
-		filename: "lightsail_token_file.bad.yml",
+		// The bearer_token/bearer_token_file conflict is enforced by the shared
+		// HTTPClientConfig validation in aws.SDConfig.UnmarshalYAML, so this
+		// path is identical for every AWS SD role; role: ec2 exercises it once
+		// rather than duplicating the same check per role.
+		filename: "aws_token_file.bad.yml",
 		errMsg:   `at most one of bearer_token & bearer_token_file must be configured`,
 	},
 	{

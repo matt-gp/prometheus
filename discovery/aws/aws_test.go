@@ -125,6 +125,8 @@ func TestDefaultSDConfig(t *testing.T) {
 	t.Parallel()
 	require.Equal(t, Role(""), DefaultSDConfig.Role)
 	require.Equal(t, model.Duration(60*time.Second), DefaultSDConfig.RefreshInterval)
+	require.Equal(t, 80, DefaultSDConfig.Port)
+	require.Equal(t, 10, DefaultSDConfig.RequestConcurrency)
 }
 
 func TestSDConfigUnmarshalYAML(t *testing.T) {
@@ -144,12 +146,11 @@ filters:
     values: [running]`,
 			validateFunc: func(t *testing.T, cfg *SDConfig) {
 				require.Equal(t, RoleEC2, cfg.Role)
-				require.NotNil(t, cfg.EC2SDConfig)
-				require.Equal(t, "us-west-2", cfg.EC2SDConfig.Region)
-				require.Equal(t, 9100, cfg.EC2SDConfig.Port)
-				require.Len(t, cfg.EC2SDConfig.Filters, 1)
-				require.Equal(t, "instance-state-name", cfg.EC2SDConfig.Filters[0].Name)
-				require.Equal(t, []string{"running"}, cfg.EC2SDConfig.Filters[0].Values)
+				require.Equal(t, "us-west-2", cfg.Region)
+				require.Equal(t, 9100, cfg.Port)
+				require.Len(t, cfg.Filters, 1)
+				require.Equal(t, "instance-state-name", cfg.Filters[0].Name)
+				require.Equal(t, []string{"running"}, cfg.Filters[0].Values)
 			},
 		},
 		{
@@ -160,10 +161,9 @@ port: 9200
 clusters: ["some-cluster"]`,
 			validateFunc: func(t *testing.T, cfg *SDConfig) {
 				require.Equal(t, RoleECS, cfg.Role)
-				require.NotNil(t, cfg.ECSSDConfig)
-				require.Equal(t, "us-east-1", cfg.ECSSDConfig.Region)
-				require.Equal(t, 9200, cfg.ECSSDConfig.Port)
-				require.Equal(t, []string{"some-cluster"}, cfg.ECSSDConfig.Clusters)
+				require.Equal(t, "us-east-1", cfg.Region)
+				require.Equal(t, 9200, cfg.Port)
+				require.Equal(t, []string{"some-cluster"}, cfg.Clusters)
 			},
 		},
 		{
@@ -173,9 +173,8 @@ region: eu-central-1
 port: 9300`,
 			validateFunc: func(t *testing.T, cfg *SDConfig) {
 				require.Equal(t, RoleLightsail, cfg.Role)
-				require.NotNil(t, cfg.LightsailSDConfig)
-				require.Equal(t, "eu-central-1", cfg.LightsailSDConfig.Region)
-				require.Equal(t, 9300, cfg.LightsailSDConfig.Port)
+				require.Equal(t, "eu-central-1", cfg.Region)
+				require.Equal(t, 9300, cfg.Port)
 			},
 		},
 		{
@@ -188,12 +187,45 @@ filters:
     values: [aurora-postgresql]`,
 			validateFunc: func(t *testing.T, cfg *SDConfig) {
 				require.Equal(t, RoleRDS, cfg.Role)
-				require.NotNil(t, cfg.RDSSDConfig)
-				require.Equal(t, "us-east-1", cfg.RDSSDConfig.Region)
-				require.Equal(t, 9400, cfg.RDSSDConfig.Port)
-				require.Len(t, cfg.RDSSDConfig.Filters, 1)
-				require.Equal(t, "engine", cfg.RDSSDConfig.Filters[0].Name)
-				require.Equal(t, []string{"aurora-postgresql"}, cfg.RDSSDConfig.Filters[0].Values)
+				require.Equal(t, "us-east-1", cfg.Region)
+				require.Equal(t, 9400, cfg.Port)
+				require.Len(t, cfg.Filters, 1)
+				require.Equal(t, "engine", cfg.Filters[0].Name)
+				require.Equal(t, []string{"aurora-postgresql"}, cfg.Filters[0].Values)
+			},
+		},
+		{
+			name: "MSKWithFlatFields",
+			yaml: `role: msk
+region: ap-south-1
+port: 9500
+clusters: ["some-cluster"]`,
+			validateFunc: func(t *testing.T, cfg *SDConfig) {
+				require.Equal(t, RoleMSK, cfg.Role)
+				require.Equal(t, "ap-south-1", cfg.Region)
+				require.Equal(t, 9500, cfg.Port)
+				require.Equal(t, []string{"some-cluster"}, cfg.Clusters)
+			},
+		},
+		{
+			name: "ElasticacheWithFlatFields",
+			yaml: `role: elasticache
+region: eu-west-1
+port: 9600`,
+			validateFunc: func(t *testing.T, cfg *SDConfig) {
+				require.Equal(t, RoleElasticache, cfg.Role)
+				require.Equal(t, "eu-west-1", cfg.Region)
+				require.Equal(t, 9600, cfg.Port)
+			},
+		},
+		{
+			name: "DefaultsApplyWhenFieldsOmitted",
+			yaml: `role: ec2
+region: us-west-2`,
+			validateFunc: func(t *testing.T, cfg *SDConfig) {
+				require.Equal(t, DefaultSDConfig.Port, cfg.Port)
+				require.Equal(t, DefaultSDConfig.RequestConcurrency, cfg.RequestConcurrency)
+				require.Equal(t, DefaultSDConfig.RefreshInterval, cfg.RefreshInterval)
 			},
 		},
 	}
@@ -208,9 +240,9 @@ filters:
 }
 
 // TestMultipleSDConfigsDoNotShareState verifies that multiple AWS SD configs
-// don't share the same underlying configuration object. This was a bug where
-// all configs pointed to the same global default, causing port and other
-// settings from one job to overwrite settings in another job.
+// parsed from the same YAML document don't bleed state into each other. This
+// was a bug where all configs pointed to the same global default, causing
+// port and other settings from one job to overwrite settings in another job.
 func TestMultipleSDConfigsDoNotShareState(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
@@ -236,22 +268,16 @@ func TestMultipleSDConfigsDoNotShareState(t *testing.T) {
 			validateFunc: func(t *testing.T, cfg1, cfg2 *SDConfig) {
 				require.Equal(t, RoleEC2, cfg1.Role)
 				require.Equal(t, RoleEC2, cfg2.Role)
-				require.NotNil(t, cfg1.EC2SDConfig)
-				require.NotNil(t, cfg2.EC2SDConfig)
 
-				// Verify ports are different and not shared
-				require.Equal(t, 9100, cfg1.EC2SDConfig.Port)
-				require.Equal(t, 9101, cfg2.EC2SDConfig.Port)
+				// Verify ports are different and not shared.
+				require.Equal(t, 9100, cfg1.Port)
+				require.Equal(t, 9101, cfg2.Port)
 
-				// Verify filters are different and not shared
-				require.Len(t, cfg1.EC2SDConfig.Filters, 1)
-				require.Len(t, cfg2.EC2SDConfig.Filters, 1)
-				require.Equal(t, []string{"host-1"}, cfg1.EC2SDConfig.Filters[0].Values)
-				require.Equal(t, []string{"host-2"}, cfg2.EC2SDConfig.Filters[0].Values)
-
-				// Most importantly: verify they're not the same pointer
-				require.NotSame(t, cfg1.EC2SDConfig, cfg2.EC2SDConfig,
-					"EC2SDConfig objects should not share the same memory address")
+				// Verify filters are different and not shared.
+				require.Len(t, cfg1.Filters, 1)
+				require.Len(t, cfg2.Filters, 1)
+				require.Equal(t, []string{"host-1"}, cfg1.Filters[0].Values)
+				require.Equal(t, []string{"host-2"}, cfg2.Filters[0].Values)
 			},
 		},
 		{
@@ -268,16 +294,11 @@ func TestMultipleSDConfigsDoNotShareState(t *testing.T) {
 			validateFunc: func(t *testing.T, cfg1, cfg2 *SDConfig) {
 				require.Equal(t, RoleECS, cfg1.Role)
 				require.Equal(t, RoleECS, cfg2.Role)
-				require.NotNil(t, cfg1.ECSSDConfig)
-				require.NotNil(t, cfg2.ECSSDConfig)
 
-				require.Equal(t, 8080, cfg1.ECSSDConfig.Port)
-				require.Equal(t, 8081, cfg2.ECSSDConfig.Port)
-				require.Equal(t, []string{"cluster-a"}, cfg1.ECSSDConfig.Clusters)
-				require.Equal(t, []string{"cluster-b"}, cfg2.ECSSDConfig.Clusters)
-
-				require.NotSame(t, cfg1.ECSSDConfig, cfg2.ECSSDConfig,
-					"ECSSDConfig objects should not share the same memory address")
+				require.Equal(t, 8080, cfg1.Port)
+				require.Equal(t, 8081, cfg2.Port)
+				require.Equal(t, []string{"cluster-a"}, cfg1.Clusters)
+				require.Equal(t, []string{"cluster-b"}, cfg2.Clusters)
 			},
 		},
 		{
@@ -292,14 +313,9 @@ func TestMultipleSDConfigsDoNotShareState(t *testing.T) {
 			validateFunc: func(t *testing.T, cfg1, cfg2 *SDConfig) {
 				require.Equal(t, RoleLightsail, cfg1.Role)
 				require.Equal(t, RoleLightsail, cfg2.Role)
-				require.NotNil(t, cfg1.LightsailSDConfig)
-				require.NotNil(t, cfg2.LightsailSDConfig)
 
-				require.Equal(t, 7070, cfg1.LightsailSDConfig.Port)
-				require.Equal(t, 7071, cfg2.LightsailSDConfig.Port)
-
-				require.NotSame(t, cfg1.LightsailSDConfig, cfg2.LightsailSDConfig,
-					"LightsailSDConfig objects should not share the same memory address")
+				require.Equal(t, 7070, cfg1.Port)
+				require.Equal(t, 7071, cfg2.Port)
 			},
 		},
 		{
@@ -316,16 +332,11 @@ func TestMultipleSDConfigsDoNotShareState(t *testing.T) {
 			validateFunc: func(t *testing.T, cfg1, cfg2 *SDConfig) {
 				require.Equal(t, RoleMSK, cfg1.Role)
 				require.Equal(t, RoleMSK, cfg2.Role)
-				require.NotNil(t, cfg1.MSKSDConfig)
-				require.NotNil(t, cfg2.MSKSDConfig)
 
-				require.Equal(t, 6060, cfg1.MSKSDConfig.Port)
-				require.Equal(t, []string{"cluster-1"}, cfg1.MSKSDConfig.Clusters)
-				require.Equal(t, 6061, cfg2.MSKSDConfig.Port)
-				require.Equal(t, []string{"cluster-2"}, cfg2.MSKSDConfig.Clusters)
-
-				require.NotSame(t, cfg1.MSKSDConfig, cfg2.MSKSDConfig,
-					"MSKSDConfig objects should not share the same memory address")
+				require.Equal(t, 6060, cfg1.Port)
+				require.Equal(t, []string{"cluster-1"}, cfg1.Clusters)
+				require.Equal(t, 6061, cfg2.Port)
+				require.Equal(t, []string{"cluster-2"}, cfg2.Clusters)
 			},
 		},
 	}
@@ -550,51 +561,6 @@ func TestAWSSDConfigUnmarshalYAML_NoRegionResolution(t *testing.T) {
 func TestRequestConcurrencyUnmarshalYAML(t *testing.T) {
 	t.Parallel()
 
-	// Every AWS SD config that exposes request_concurrency, along with the
-	// default it falls back to when the field is omitted.
-	configs := []struct {
-		name               string
-		defaultConcurrency int
-		parse              func(string) (int, error)
-	}{
-		{
-			name:               "ecs_sd",
-			defaultConcurrency: DefaultECSSDConfig.RequestConcurrency,
-			parse: func(s string) (int, error) {
-				var cfg ECSSDConfig
-				err := yaml.Unmarshal([]byte(s), &cfg)
-				return cfg.RequestConcurrency, err
-			},
-		},
-		{
-			name:               "elasticache_sd",
-			defaultConcurrency: DefaultElasticacheSDConfig.RequestConcurrency,
-			parse: func(s string) (int, error) {
-				var cfg ElasticacheSDConfig
-				err := yaml.Unmarshal([]byte(s), &cfg)
-				return cfg.RequestConcurrency, err
-			},
-		},
-		{
-			name:               "msk_sd",
-			defaultConcurrency: DefaultMSKSDConfig.RequestConcurrency,
-			parse: func(s string) (int, error) {
-				var cfg MSKSDConfig
-				err := yaml.Unmarshal([]byte(s), &cfg)
-				return cfg.RequestConcurrency, err
-			},
-		},
-		{
-			name:               "rds_sd",
-			defaultConcurrency: DefaultRDSSDConfig.RequestConcurrency,
-			parse: func(s string) (int, error) {
-				var cfg RDSSDConfig
-				err := yaml.Unmarshal([]byte(s), &cfg)
-				return cfg.RequestConcurrency, err
-			},
-		},
-	}
-
 	cases := []struct {
 		name        string
 		yaml        string
@@ -605,12 +571,12 @@ func TestRequestConcurrencyUnmarshalYAML(t *testing.T) {
 		{
 			name:        "Zero",
 			yaml:        "request_concurrency: 0",
-			expectedErr: "request_concurrency must be positive, got 0",
+			expectedErr: "aws_sd: request_concurrency must be positive, got 0",
 		},
 		{
 			name:        "Negative",
 			yaml:        "request_concurrency: -1",
-			expectedErr: "request_concurrency must be positive, got -1",
+			expectedErr: "aws_sd: request_concurrency must be positive, got -1",
 		},
 		{
 			name:     "Positive",
@@ -624,25 +590,25 @@ func TestRequestConcurrencyUnmarshalYAML(t *testing.T) {
 		},
 	}
 
-	for _, cfg := range configs {
-		for _, tt := range cases {
-			t.Run(cfg.name+"/"+tt.name, func(t *testing.T) {
-				t.Parallel()
-				got, err := cfg.parse("region: us-west-2\n" + tt.yaml + "\n")
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 
-				if tt.expectedErr != "" {
-					require.EqualError(t, err, cfg.name+": "+tt.expectedErr)
-					return
-				}
+			var cfg SDConfig
+			err := yaml.Unmarshal([]byte("role: ec2\nregion: us-west-2\n"+tt.yaml+"\n"), &cfg)
 
-				require.NoError(t, err)
-				expected := tt.expected
-				if tt.wantDefault {
-					expected = cfg.defaultConcurrency
-				}
-				require.Equal(t, expected, got)
-			})
-		}
+			if tt.expectedErr != "" {
+				require.EqualError(t, err, tt.expectedErr)
+				return
+			}
+
+			require.NoError(t, err)
+			expected := tt.expected
+			if tt.wantDefault {
+				expected = DefaultSDConfig.RequestConcurrency
+			}
+			require.Equal(t, expected, cfg.RequestConcurrency)
+		})
 	}
 }
 
@@ -718,17 +684,4 @@ region: us-west-1
 			})
 		})
 	}
-
-	t.Run("SetDirectoryWithNilConfigs", func(t *testing.T) {
-		// Test that SetDirectory doesn't panic when called on an SDConfig
-		// where the role-specific config might be nil (this was the original bug)
-		cfg := SDConfig{
-			Role: RoleEC2,
-			// EC2SDConfig is nil - this would have caused a panic before the fix
-		}
-		// This should not panic
-		require.NotPanics(t, func() {
-			cfg.SetDirectory(tmpDir)
-		})
-	})
 }

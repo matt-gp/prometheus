@@ -15,29 +15,17 @@ package aws
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"log/slog"
 	"net"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
-	awsConfig "github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/credentials"
-	"github.com/aws/aws-sdk-go-v2/credentials/stscreds"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	ec2Types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
-	"github.com/aws/aws-sdk-go-v2/service/sts"
-	"github.com/aws/smithy-go"
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/common/config"
 	"github.com/prometheus/common/model"
-	"github.com/prometheus/common/promslog"
 
-	"github.com/prometheus/prometheus/discovery"
-	"github.com/prometheus/prometheus/discovery/refresh"
 	"github.com/prometheus/prometheus/discovery/targetgroup"
 	"github.com/prometheus/prometheus/util/strutil"
 )
@@ -69,75 +57,15 @@ const (
 	ec2LabelSeparator            = ","
 )
 
-// DefaultEC2SDConfig is the default EC2 SD configuration.
-var DefaultEC2SDConfig = EC2SDConfig{
-	Port:             80,
-	RefreshInterval:  model.Duration(60 * time.Second),
-	HTTPClientConfig: config.DefaultHTTPClientConfig,
+// EC2Discovery is the AWS discovery implementation for EC2.
+// It implements the awsRefresher interface, which allows it to refresh AWS targets for EC2.
+type EC2Discovery struct {
+	Discovery
+	ec2      ec2ClientAdapter
+	azToAZID map[string]string
 }
 
-func init() {
-	discovery.RegisterConfig(&EC2SDConfig{})
-}
-
-// EC2SDConfig is the configuration for EC2 based service discovery.
-type EC2SDConfig struct {
-	Endpoint        string         `yaml:"endpoint"`
-	Region          string         `yaml:"region"`
-	AccessKey       string         `yaml:"access_key,omitempty"`
-	SecretKey       config.Secret  `yaml:"secret_key,omitempty"`
-	Profile         string         `yaml:"profile,omitempty"`
-	RoleARN         string         `yaml:"role_arn,omitempty"`
-	ExternalID      string         `yaml:"external_id,omitempty"`
-	RefreshInterval model.Duration `yaml:"refresh_interval,omitempty"`
-	Port            int            `yaml:"port"`
-	Filters         []*Filter      `yaml:"filters"`
-
-	HTTPClientConfig config.HTTPClientConfig `yaml:",inline"`
-}
-
-// NewDiscovererMetrics implements discovery.Config.
-func (*EC2SDConfig) NewDiscovererMetrics(_ prometheus.Registerer, rmi discovery.RefreshMetricsInstantiator) discovery.DiscovererMetrics {
-	return &ec2Metrics{
-		refreshMetrics: rmi,
-	}
-}
-
-// Name returns the name of the EC2 Config.
-func (*EC2SDConfig) Name() string { return "ec2" }
-
-// NewDiscoverer returns a Discoverer for the EC2 Config.
-func (c *EC2SDConfig) NewDiscoverer(opts discovery.DiscovererOptions) (discovery.Discoverer, error) {
-	return NewEC2Discovery(c, opts)
-}
-
-// SetDirectory joins any relative file paths with dir.
-func (c *EC2SDConfig) SetDirectory(dir string) {
-	c.HTTPClientConfig.SetDirectory(dir)
-}
-
-// UnmarshalYAML implements the yaml.Unmarshaler interface for the EC2 Config.
-// Region resolution is deferred to ec2Client; see loadRegion.
-func (c *EC2SDConfig) UnmarshalYAML(unmarshal func(any) error) error {
-	*c = DefaultEC2SDConfig
-	type plain EC2SDConfig
-	err := unmarshal((*plain)(c))
-	if err != nil {
-		return err
-	}
-
-	for _, f := range c.Filters {
-		if len(f.Values) == 0 {
-			return errors.New("EC2 SD configuration filter values cannot be empty")
-		}
-	}
-	return c.HTTPClientConfig.Validate()
-}
-
-type ec2Client interface {
-	DescribeAvailabilityZones(ctx context.Context, params *ec2.DescribeAvailabilityZonesInput, optFns ...func(*ec2.Options)) (*ec2.DescribeAvailabilityZonesOutput, error)
-	DescribeInstances(ctx context.Context, params *ec2.DescribeInstancesInput, optFns ...func(*ec2.Options)) (*ec2.DescribeInstancesOutput, error)
-}
+var _ awsDiscovery = (*EC2Discovery)(nil)
 
 // ec2ClientAdapter holds the EC2 API calls that AWS discovery actually uses as
 // method-value closures over the concrete *ec2.Client.
@@ -180,109 +108,29 @@ func (a ec2ClientAdapter) DescribeNetworkInterfaces(ctx context.Context, params 
 	return a.describeNetworkInterfaces(ctx, params, optFns...)
 }
 
-// EC2Discovery periodically performs EC2-SD requests. It implements
-// the Discoverer interface.
-type EC2Discovery struct {
-	*refresh.Discovery
-	logger *slog.Logger
-	cfg    *EC2SDConfig
-	ec2    ec2Client
+// newEC2Discovery creates a new EC2Discovery instance
+func newEC2Discovery(ctx context.Context, cfg aws.Config, d *Discovery) (*EC2Discovery, error) {
 
-	// region is the resolved region used for the AWS client and for the
-	// Source / __meta_ec2_region labels. Lazily populated by ec2Client.
-	region string
-
-	// azToAZID maps this account's availability zones to their underlying AZ
-	// ID, e.g. eu-west-2a -> euw2-az2. Refreshes are performed sequentially, so
-	// no locking is required.
-	azToAZID map[string]string
-}
-
-// NewEC2Discovery returns a new EC2Discovery which periodically refreshes its targets.
-func NewEC2Discovery(conf *EC2SDConfig, opts discovery.DiscovererOptions) (*EC2Discovery, error) {
-	m, ok := opts.Metrics.(*ec2Metrics)
-	if !ok {
-		return nil, errors.New("invalid discovery metrics type")
-	}
-
-	if opts.Logger == nil {
-		opts.Logger = promslog.NewNopLogger()
-	}
-	d := &EC2Discovery{
-		logger: opts.Logger,
-		cfg:    conf,
-	}
-	d.Discovery = refresh.NewDiscovery(
-		refresh.Options{
-			Logger:              opts.Logger,
-			Mech:                "ec2",
-			SetName:             opts.SetName,
-			Interval:            time.Duration(d.cfg.RefreshInterval),
-			RefreshF:            d.refresh,
-			MetricsInstantiator: m.refreshMetrics,
-		},
-	)
-	return d, nil
-}
-
-func (d *EC2Discovery) ec2Client(ctx context.Context) (ec2Client, error) {
-	if d.ec2 != nil {
-		return d.ec2, nil
-	}
-
-	// Build the HTTP client from the provided HTTPClientConfig.
-	httpClient, err := config.NewClientFromConfig(d.cfg.HTTPClientConfig, "ec2_sd")
-	if err != nil {
-		return nil, err
-	}
-
-	// Resolve the region lazily. See EC2SDConfig.UnmarshalYAML.
-	d.region, err = loadRegion(ctx, d.cfg.Region)
-	if err != nil {
-		return nil, err
-	}
-
-	// Build the AWS config with the resolved region.
-	configOptions := []func(*awsConfig.LoadOptions) error{
-		awsConfig.WithRegion(d.region),
-		awsConfig.WithHTTPClient(httpClient),
-	}
-
-	// Only set static credentials if both access key and secret key are provided.
-	// Otherwise, let the AWS SDK use its default credential chain (environment variables, IAM role, etc.).
-	if d.cfg.AccessKey != "" && d.cfg.SecretKey != "" {
-		credProvider := credentials.NewStaticCredentialsProvider(d.cfg.AccessKey, string(d.cfg.SecretKey), "")
-		configOptions = append(configOptions, awsConfig.WithCredentialsProvider(credProvider))
-	}
-
-	// Set the profile if provided.
-	if d.cfg.Profile != "" {
-		configOptions = append(configOptions, awsConfig.WithSharedConfigProfile(d.cfg.Profile))
-	}
-
-	cfg, err := awsConfig.LoadDefaultConfig(ctx, configOptions...)
-	if err != nil {
-		return nil, fmt.Errorf("could not create aws config: %w", err)
-	}
-
-	// If the role ARN is set, assume the role to get credentials and set the credentials provider in the config.
-	if d.cfg.RoleARN != "" {
-		assumeProvider := stscreds.NewAssumeRoleProvider(sts.NewFromConfig(cfg), d.cfg.RoleARN, func(o *stscreds.AssumeRoleOptions) {
-			if d.cfg.ExternalID != "" {
-				o.ExternalID = aws.String(d.cfg.ExternalID)
-			}
-		})
-		cfg.Credentials = aws.NewCredentialsCache(assumeProvider)
-	}
-
-	d.ec2 = newEC2ClientAdapter(ec2.NewFromConfig(cfg, func(options *ec2.Options) {
+	ec2ClientAdapter := newEC2ClientAdapter(ec2.NewFromConfig(cfg, func(options *ec2.Options) {
 		if d.cfg.Endpoint != "" {
 			options.BaseEndpoint = &d.cfg.Endpoint
 		}
-		options.HTTPClient = httpClient
+		options.HTTPClient = cfg.HTTPClient
 	}))
 
-	return d.ec2, nil
+	// Test credentials by making a simple API call
+	testCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	_, err := ec2ClientAdapter.DescribeAvailabilityZones(testCtx, &ec2.DescribeAvailabilityZonesInput{})
+	if err != nil {
+		return nil, fmt.Errorf("unable to describe availability zones: %w", err)
+	}
+
+	return &EC2Discovery{
+		Discovery: *d,
+		ec2:       ec2ClientAdapter,
+	}, nil
 }
 
 func (d *EC2Discovery) refreshAZIDs(ctx context.Context) error {
@@ -305,10 +153,6 @@ func (d *EC2Discovery) refreshAZIDs(ctx context.Context) error {
 }
 
 func (d *EC2Discovery) refresh(ctx context.Context) ([]*targetgroup.Group, error) {
-	ec2Client, err := d.ec2Client(ctx)
-	if err != nil {
-		return nil, err
-	}
 
 	tg := &targetgroup.Group{
 		Source: d.region,
@@ -334,15 +178,11 @@ func (d *EC2Discovery) refresh(ctx context.Context) ([]*targetgroup.Group, error
 	}
 
 	input := &ec2.DescribeInstancesInput{Filters: filters}
-	paginator := ec2.NewDescribeInstancesPaginator(ec2Client, input)
+	paginator := ec2.NewDescribeInstancesPaginator(d.ec2, input)
 
 	for paginator.HasMorePages() {
 		p, err := paginator.NextPage(ctx)
 		if err != nil {
-			var awsErr smithy.APIError
-			if errors.As(err, &awsErr) && (awsErr.ErrorCode() == "AuthFailure" || awsErr.ErrorCode() == "UnauthorizedOperation") {
-				d.ec2 = nil
-			}
 			return nil, fmt.Errorf("could not describe instances: %w", err)
 		}
 
