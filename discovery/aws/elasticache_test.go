@@ -116,10 +116,18 @@ func TestElasticacheDiscoveryDescribeServerlessCaches(t *testing.T) {
 			client := newMockElasticacheClient(tt.ecData)
 
 			d := &ElasticacheDiscovery{
-				elasticacheClient: client,
-				cfg: &ElasticacheSDConfig{
-					Region:             tt.ecData.region,
-					RequestConcurrency: 10,
+				Discovery: Discovery{
+					logger: promslog.NewNopLogger(),
+					cfg: &SDConfig{
+						Role:               RoleElasticache,
+						Region:             tt.ecData.region,
+						RequestConcurrency: 10,
+					},
+				},
+				elasticacheClient: elasticacheClientAdapter{
+					describeServerlessCaches: client.DescribeServerlessCaches,
+					describeCacheClusters:    client.DescribeCacheClusters,
+					listTagsForResource:      client.ListTagsForResource,
 				},
 			}
 
@@ -659,19 +667,25 @@ func TestSplitCacheDeploymentOptions(t *testing.T) {
 	}
 }
 
-// elasticacheTestDiscovery returns a discovery backed by the mock client, so
-// refresh() can be exercised without reaching AWS. initElasticacheClient returns
-// early when elasticacheClient is already set, which also leaves region unset,
-// so it is populated here.
+// elasticacheTestDiscovery returns a refresher backed by the mock client, so
+// refreshAWSTargets() can be exercised without reaching AWS.
 func elasticacheTestDiscovery(data *elasticacheDataStore) *ElasticacheDiscovery {
+	client := newMockElasticacheClient(data)
 	return &ElasticacheDiscovery{
-		logger:            promslog.NewNopLogger(),
-		elasticacheClient: newMockElasticacheClient(data),
-		cfg: &ElasticacheSDConfig{
-			Region:             data.region,
-			RequestConcurrency: 10,
+		Discovery: Discovery{
+			logger: promslog.NewNopLogger(),
+			cfg: &SDConfig{
+				Role:               RoleElasticache,
+				Region:             data.region,
+				RequestConcurrency: 10,
+			},
+			region: data.region,
 		},
-		region: data.region,
+		elasticacheClient: elasticacheClientAdapter{
+			describeServerlessCaches: client.DescribeServerlessCaches,
+			describeCacheClusters:    client.DescribeCacheClusters,
+			listTagsForResource:      client.ListTagsForResource,
+		},
 	}
 }
 
@@ -978,13 +992,20 @@ func BenchmarkElasticacheRefreshAPILatency(b *testing.B) {
 	client := newMockElasticacheClient(data)
 	client.onDescribe = func() { time.Sleep(roundTrip) }
 	d := &ElasticacheDiscovery{
-		logger:            promslog.NewNopLogger(),
-		elasticacheClient: client,
-		cfg: &ElasticacheSDConfig{
-			Region:             data.region,
-			RequestConcurrency: 10,
+		Discovery: Discovery{
+			logger: promslog.NewNopLogger(),
+			cfg: &SDConfig{
+				Role:               RoleElasticache,
+				Region:             data.region,
+				RequestConcurrency: 10,
+			},
+			region: data.region,
 		},
-		region: data.region,
+		elasticacheClient: elasticacheClientAdapter{
+			describeServerlessCaches: client.DescribeServerlessCaches,
+			describeCacheClusters:    client.DescribeCacheClusters,
+			listTagsForResource:      client.ListTagsForResource,
+		},
 	}
 
 	b.ReportAllocs()
@@ -999,24 +1020,31 @@ func BenchmarkElasticacheRefreshAPILatency(b *testing.B) {
 	}
 }
 
-// TestElasticacheRefreshDescribesEachResourceOnce covers refresh() asking the
-// API for the same resources twice: once to collect the ARNs the tag lookup
-// needs, and once more to build the targets. Both rounds send identical
-// requests and get identical answers, so the second one only spends the
-// account's API quota.
+// TestElasticacheRefreshDescribesEachResourceOnce covers refreshAWSTargets()
+// asking the API for the same resources twice: once to collect the ARNs the
+// tag lookup needs, and once more to build the targets. Both rounds send
+// identical requests and get identical answers, so the second one only
+// spends the account's API quota.
 func TestElasticacheRefreshDescribesEachResourceOnce(t *testing.T) {
 	t.Parallel()
 
 	data := elasticacheFixture(2, 2, 1)
 	client := newMockElasticacheClient(data)
 	d := &ElasticacheDiscovery{
-		logger:            promslog.NewNopLogger(),
-		elasticacheClient: client,
-		cfg: &ElasticacheSDConfig{
-			Region:             data.region,
-			RequestConcurrency: 10,
+		Discovery: Discovery{
+			logger: promslog.NewNopLogger(),
+			cfg: &SDConfig{
+				Role:               RoleElasticache,
+				Region:             data.region,
+				RequestConcurrency: 10,
+			},
+			region: data.region,
 		},
-		region: data.region,
+		elasticacheClient: elasticacheClientAdapter{
+			describeServerlessCaches: client.DescribeServerlessCaches,
+			describeCacheClusters:    client.DescribeCacheClusters,
+			listTagsForResource:      client.ListTagsForResource,
+		},
 	}
 
 	_, err := d.refresh(context.Background())
@@ -1069,23 +1097,33 @@ func TestElasticacheDescribeCacheClustersReturnsEachClusterOnce(t *testing.T) {
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
+			client := newMockElasticacheClient(&elasticacheDataStore{
+				region: "us-east-1",
+				cacheClusters: []types.CacheCluster{
+					// Memcached and single node clusters are not members of
+					// a replication group, so both API responses carry them.
+					{CacheClusterId: strptr("standalone-001")},
+					{
+						CacheClusterId:     strptr("member-001"),
+						ReplicationGroupId: strptr("my-replication-group"),
+					},
+				},
+			})
 
 			d := &ElasticacheDiscovery{
-				elasticacheClient: newMockElasticacheClient(&elasticacheDataStore{
-					region: "us-east-1",
-					cacheClusters: []types.CacheCluster{
-						// Memcached and single node clusters are not members of
-						// a replication group, so both API responses carry them.
-						{CacheClusterId: strptr("standalone-001")},
-						{
-							CacheClusterId:     strptr("member-001"),
-							ReplicationGroupId: strptr("my-replication-group"),
-						},
+				Discovery: Discovery{
+					logger: promslog.NewNopLogger(),
+					cfg: &SDConfig{
+						Role:               RoleElasticache,
+						Region:             "us-east-1",
+						RequestConcurrency: 10,
 					},
-				}),
-				cfg: &ElasticacheSDConfig{
-					Region:             "us-east-1",
-					RequestConcurrency: 10,
+					region: "us-east-1",
+				},
+				elasticacheClient: elasticacheClientAdapter{
+					describeServerlessCaches: client.DescribeServerlessCaches,
+					describeCacheClusters:    client.DescribeCacheClusters,
+					listTagsForResource:      client.ListTagsForResource,
 				},
 			}
 

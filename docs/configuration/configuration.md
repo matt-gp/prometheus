@@ -1972,6 +1972,8 @@ names:
 
 ### `<ec2_sd_config>`
 
+DEPRECATED (please use `aws_sd_config`)
+
 EC2 SD configurations allow retrieving scrape targets from AWS EC2
 instances. The private IP address is used by default, but may be changed to
 the public IP address with relabeling.
@@ -2897,6 +2899,8 @@ The [relabeling phase](#relabel_config) is the preferred and more powerful way
 to filter proxies and user-defined tags.
 
 ### `<lightsail_sd_config>`
+
+DEPRECATED (please use `aws_sd_config`)
 
 Lightsail SD configurations allow retrieving scrape targets from [AWS Lightsail](https://aws.amazon.com/lightsail/)
 instances. The private IP address is used by default, but may be changed to
@@ -3978,6 +3982,7 @@ dns_sd_configs:
   [ - <dns_sd_config> ... ]
 
 # List of EC2 service discovery configurations.
+# DEPRECATED (please use `aws_sd_configs`)
 ec2_sd_configs:
   [ - <ec2_sd_config> ... ]
 
@@ -4022,6 +4027,7 @@ kubernetes_sd_configs:
   [ - <kubernetes_sd_config> ... ]
 
 # List of Lightsail service discovery configurations.
+# DEPRECATED (please use `aws_sd_configs`)
 lightsail_sd_configs:
   [ - <lightsail_sd_config> ... ]
 

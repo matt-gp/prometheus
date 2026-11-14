@@ -373,13 +373,20 @@ func TestRDSDiscoveryRefresh(t *testing.T) {
 			}
 
 			d := &RDSDiscovery{
-				logger: promslog.NewNopLogger(),
-				rds:    mockClient,
-				cfg: &RDSSDConfig{
-					Region:             "us-east-1",
-					Port:               9187,
-					RequestConcurrency: 10,
-					Filters:            tt.filters,
+				Discovery: Discovery{
+					logger: promslog.NewNopLogger(),
+					cfg: &SDConfig{
+						Role:               RoleRDS,
+						Region:             "us-east-1",
+						Port:               9187,
+						RequestConcurrency: 10,
+						Filters:            tt.filters,
+					},
+					region: "us-east-1",
+				},
+				rds: rdsClientAdapter{
+					describeDBClusters:  mockClient.DescribeDBClusters,
+					describeDBInstances: mockClient.DescribeDBInstances,
 				},
 			}
 
@@ -422,9 +429,15 @@ func TestDescribeAllDBClusters(t *testing.T) {
 	}
 
 	d := &RDSDiscovery{
-		rds: mockClient,
-		cfg: &RDSSDConfig{
-			RequestConcurrency: 10,
+		Discovery: Discovery{
+			cfg: &SDConfig{
+				Role:               RoleRDS,
+				RequestConcurrency: 10,
+			},
+		},
+		rds: rdsClientAdapter{
+			describeDBClusters:  mockClient.DescribeDBClusters,
+			describeDBInstances: mockClient.DescribeDBInstances,
 		},
 	}
 
@@ -560,13 +573,21 @@ func BenchmarkRDSRefresh(b *testing.B) {
 	for _, bm := range benchmarks {
 		b.Run(bm.name, func(b *testing.B) {
 			clusters, instances := rdsFixture(bm.clusters, bm.instances)
+			mockClient := &mockRDSClient{clusters: clusters, instances: instances}
 			d := &RDSDiscovery{
-				logger: promslog.NewNopLogger(),
-				rds:    &mockRDSClient{clusters: clusters, instances: instances},
-				cfg: &RDSSDConfig{
-					Region:             "us-east-1",
-					Port:               9187,
-					RequestConcurrency: 10,
+				Discovery: Discovery{
+					logger: promslog.NewNopLogger(),
+					cfg: &SDConfig{
+						Role:               RoleRDS,
+						Region:             "us-east-1",
+						Port:               9187,
+						RequestConcurrency: 10,
+					},
+					region: "us-east-1",
+				},
+				rds: rdsClientAdapter{
+					describeDBClusters:  mockClient.DescribeDBClusters,
+					describeDBInstances: mockClient.DescribeDBInstances,
 				},
 			}
 
@@ -595,17 +616,25 @@ func BenchmarkRDSRefreshAPILatency(b *testing.B) {
 	)
 	clusters, instances := rdsFixture(clusterCount, 2)
 
+	mockClient := &mockRDSClient{
+		clusters:              clusters,
+		instances:             instances,
+		onDescribeDBInstances: func() { time.Sleep(roundTrip) },
+	}
 	d := &RDSDiscovery{
-		logger: promslog.NewNopLogger(),
-		rds: &mockRDSClient{
-			clusters:              clusters,
-			instances:             instances,
-			onDescribeDBInstances: func() { time.Sleep(roundTrip) },
+		Discovery: Discovery{
+			logger: promslog.NewNopLogger(),
+			cfg: &SDConfig{
+				Role:               RoleRDS,
+				Region:             "us-east-1",
+				Port:               9187,
+				RequestConcurrency: 10,
+			},
+			region: "us-east-1",
 		},
-		cfg: &RDSSDConfig{
-			Region:             "us-east-1",
-			Port:               9187,
-			RequestConcurrency: 10,
+		rds: rdsClientAdapter{
+			describeDBClusters:  mockClient.DescribeDBClusters,
+			describeDBInstances: mockClient.DescribeDBInstances,
 		},
 	}
 
@@ -662,12 +691,19 @@ func TestRDSDiscoveryDescribesInstancesConcurrently(t *testing.T) {
 	}
 
 	d := &RDSDiscovery{
-		logger: promslog.NewNopLogger(),
-		rds:    mockClient,
-		cfg: &RDSSDConfig{
-			Region:             "us-east-1",
-			Port:               9187,
-			RequestConcurrency: concurrency,
+		Discovery: Discovery{
+			logger: promslog.NewNopLogger(),
+			cfg: &SDConfig{
+				Role:               RoleRDS,
+				Region:             "us-east-1",
+				Port:               9187,
+				RequestConcurrency: concurrency,
+			},
+			region: "us-east-1",
+		},
+		rds: rdsClientAdapter{
+			describeDBClusters:  mockClient.DescribeDBClusters,
+			describeDBInstances: mockClient.DescribeDBInstances,
 		},
 	}
 
